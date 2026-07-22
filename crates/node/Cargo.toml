@@ -1,0 +1,35 @@
+[package]
+name = "node"
+description = "Kestrel validator node binary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bcs.workspace = true
+consensus = { path = "../consensus" }
+crypto = { path = "../crypto" }
+execution = { path = "../execution" }
+hex.workspace = true
+libp2p.workspace = true
+mempool = { path = "../mempool" }
+network = { path = "../network" }
+rpc = { path = "../rpc" }
+serde.workspace = true
+serde_json.workspace = true
+state = { path = "../state" }
+storage = { path = "../storage" }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+types.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

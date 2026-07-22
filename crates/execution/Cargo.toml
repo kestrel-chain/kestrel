@@ -1,0 +1,31 @@
+[package]
+name = "execution"
+description = "Deferred and parallel transaction execution"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rayon.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+state = { path = "../state" }
+types.workspace = true
+vm-move = { path = "../vm-move" }
+
+[dev-dependencies]
+criterion.workspace = true
+loom.workspace = true
+move-binary-format.workspace = true
+move-compiler.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
+
+[[bench]]
+name = "parallel_scaling"
+harness = false
+
+[lints]
+workspace = true

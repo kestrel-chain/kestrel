@@ -1,0 +1,19 @@
+[package]
+name = "storage"
+description = "Storage abstractions and RocksDB persistence for Kestrel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rocksdb.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
+

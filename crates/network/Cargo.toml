@@ -1,0 +1,24 @@
+[package]
+name = "network"
+description = "Peer discovery, transaction gossip, and KestrelCast block propagation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+futures.workspace = true
+libp2p.workspace = true
+rand.workspace = true
+reed-solomon-erasure.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+types.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

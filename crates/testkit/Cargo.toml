@@ -1,0 +1,32 @@
+[package]
+name = "testkit"
+description = "Local devnet, simulation, chaos injection, and cross-crate integration harnesses"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+consensus = { path = "../consensus" }
+crypto = { path = "../crypto" }
+execution = { path = "../execution" }
+network = { path = "../network" }
+rand.workspace = true
+state = { path = "../state" }
+thiserror.workspace = true
+types.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "propagation"
+harness = false
+
+[[bench]]
+name = "finality"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,3 @@
+# execution
+
+Deterministic transaction execution for Kestrel. `SequentialExecutor` preserves the Phase 1 reference semantics. `ParallelExecutor` performs Block-STM-style parallel speculation, records object read/write sets, validates them against earlier canonical writes, re-executes conflicts, and commits in transaction order. Statically complete single-owner references use owner-partitioned structural fast-path lanes; IDs claimed by different owner lanes and resurrection-owner mismatches are disqualified. `DeferredExecutor` adds the one-block bounded asynchronous stage from finalized transaction order to state execution.

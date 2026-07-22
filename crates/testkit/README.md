@@ -1,0 +1,5 @@
+# testkit
+
+Local devnet, simulation, chaos injection, and cross-crate integration harnesses. Phase 3 includes a deterministic KestrelCast model for 20+ validators with stake, latency, jitter, loss, relay failure, actual shred reconstruction, and propagation time to a stake percentile. Phase 4 adds Kestrel-BFT leader equivocation, vote withholding, offline, partition, delay, and message-loss injection under the explicit 20+20 resilience model.
+
+Phase 6 adds a repeatable 100-scenario CI campaign and a `ChaosTarget` adapter for continuous campaigns against an operator-authorized external testnet controller. The campaign includes a selective-delivery safety probe that calls the production consensus replica and certificate code. A separate five-process raw-TCP test covers leader equivocation and the other Stage 2 consensus faults while comparing finalized hashes across independent RPC endpoints. The external harness detects conflicting finalized hashes, enforces a bounded finality-stall window, and always requests `HealAll` before returning. Provider credentials and destructive cloud/Kubernetes commands do not live in this repository.

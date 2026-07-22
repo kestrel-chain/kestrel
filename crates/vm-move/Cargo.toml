@@ -1,0 +1,26 @@
+[package]
+name = "vm-move"
+description = "Move VM hosting and Kestrel object/resource primitives"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+move-binary-format.workspace = true
+move-core-types.workspace = true
+move-vm-runtime.workspace = true
+move-vm-test-utils.workspace = true
+move-vm-types.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+state = { path = "../state" }
+types.workspace = true
+
+[dev-dependencies]
+move-compiler.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
