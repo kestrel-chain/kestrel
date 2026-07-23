@@ -94,6 +94,7 @@ async fn stage2_pipeline_commits_a_gossiped_transaction_across_all_nodes() {
         equivocation_slash_basis_points: 5_000,
         validators: validators.clone(),
         initial_objects: vec![target.clone()],
+        initial_fee_balances: BTreeMap::new(),
     };
     let validated = genesis.validate().unwrap();
 
@@ -204,7 +205,10 @@ async fn stage2_pipeline_commits_a_gossiped_transaction_across_all_nodes() {
     let transaction = signed_mutation(&account_key, &account_public_key, owner, 0, &target, 0, 42);
     handles[0].submit_transaction(transaction).unwrap();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    // 45s, not 20s: this fixture runs four full tokio multi-threaded
+    // runtimes with real libp2p/BLS, and a busy shared CI runner has been
+    // observed to need far longer than the ~1.6s this takes locally.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     loop {
         let all_committed = object_states.iter().all(|state| {
             state
@@ -304,6 +308,7 @@ async fn malformed_gossiped_transaction_does_not_kill_the_pipeline() {
         equivocation_slash_basis_points: 5_000,
         validators: validators.clone(),
         initial_objects: vec![target.clone()],
+        initial_fee_balances: BTreeMap::new(),
     };
     let validated = genesis.validate().unwrap();
 
@@ -451,7 +456,8 @@ async fn malformed_gossiped_transaction_does_not_kill_the_pipeline() {
     let transaction = signed_mutation(&account_key, &account_public_key, owner, 0, &target, 0, 77);
     handles[0].submit_transaction(transaction).unwrap();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    // See the matching comment in the sibling test above for why 45s.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
     loop {
         let all_committed = object_states.iter().all(|state| {
             state
@@ -541,6 +547,7 @@ async fn admitted_transaction_survives_a_restart_before_finalization() {
         equivocation_slash_basis_points: 5_000,
         validators: validators.clone(),
         initial_objects: vec![target.clone()],
+        initial_fee_balances: BTreeMap::new(),
     };
     let validated = genesis.validate().unwrap();
 
@@ -654,7 +661,7 @@ async fn admitted_transaction_survives_a_restart_before_finalization() {
     )
     .unwrap();
 
-    let restored_ids = pipeline
+    let (restored_ids, _fee_commitment) = pipeline
         .proposal_source()
         .transaction_ids(1, validated.genesis_hash)
         .expect("the durably re-admitted transaction is available to propose");
