@@ -475,10 +475,16 @@ impl PipelineProposalSource {
                     .ok_or(PipelineError::SelectedTransactionUnavailable)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let base_fees = selection
+            .transactions
+            .iter()
+            .map(|pending| pending.local_base_fee_per_compute)
+            .collect();
         let payload = PropagatedBlock {
             height,
             parent_id,
             transactions,
+            base_fees,
         };
         state.payloads.insert(key, payload.clone());
         Ok(payload)
@@ -604,10 +610,11 @@ impl PipelineProposalSource {
 }
 
 impl ProposalTransactionSource for PipelineProposalSource {
-    fn transaction_ids(&self, height: u64, parent_id: Hash) -> Option<Vec<Hash>> {
+    fn transaction_ids(&self, height: u64, parent_id: Hash) -> Option<(Vec<Hash>, Hash)> {
         let payload = self.build_or_get_payload(height, parent_id).ok()?;
         self.propagate(height, parent_id, &payload).ok()?;
-        payload.transaction_ids().ok()
+        let transaction_ids = payload.transaction_ids().ok()?;
+        Some((transaction_ids, payload.fee_commitment()))
     }
 }
 

@@ -252,6 +252,7 @@ fn production_cross_view_fast_safety(
         parent,
         validator_set.leader(1, 0).id,
         vec![Hash::digest(b"selectively-delivered-fast-block")],
+        Hash::default(),
         None,
     );
     let mut replicas = validators
@@ -475,6 +476,7 @@ fn run_equivocation_trial(random: &mut StdRng) -> Result<TrialOutcome, Consensus
         parent,
         leader,
         vec![Hash::digest(random.r#gen::<u64>().to_be_bytes())],
+        Hash::default(),
         None,
     );
     let proposal_b = Proposal::new(
@@ -483,6 +485,7 @@ fn run_equivocation_trial(random: &mut StdRng) -> Result<TrialOutcome, Consensus
         parent,
         leader,
         vec![Hash::digest(random.r#gen::<u64>().to_be_bytes())],
+        Hash::default(),
         None,
     );
     let signed_a = SignedProposal::sign(proposal_a.clone(), &key_by_id[&leader], scheme.as_ref())?;

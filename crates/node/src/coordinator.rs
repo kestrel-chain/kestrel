@@ -85,21 +85,26 @@ enum WireMessage {
     Certificate {
         certificate: QuorumCertificate,
         transaction_ids: Option<Vec<Hash>>,
+        fee_commitment: Option<Hash>,
     },
 }
 
-/// Supplies the canonical transaction IDs a leader should order at a height.
-/// Returning `None` leaves the height open without proposing synthetic work.
+/// Supplies the canonical transaction IDs and fee commitment a leader should
+/// order at a height. Returning `None` leaves the height open without
+/// proposing synthetic work. The fee commitment binds whatever per-transaction
+/// local base fees the source chose (see `consensus::fee_commitment`) into the
+/// certified block, so it must be the same one recoverable from the actual
+/// propagated payload — see `BlockLifecycle::submit_payload`.
 pub trait ProposalTransactionSource: Send + Sync {
-    fn transaction_ids(&self, height: u64, parent_id: Hash) -> Option<Vec<Hash>>;
+    fn transaction_ids(&self, height: u64, parent_id: Hash) -> Option<(Vec<Hash>, Hash)>;
 }
 
 #[derive(Debug)]
 struct SyntheticProposalSource;
 
 impl ProposalTransactionSource for SyntheticProposalSource {
-    fn transaction_ids(&self, height: u64, _parent_id: Hash) -> Option<Vec<Hash>> {
-        Some(vec![Hash::digest(height.to_be_bytes())])
+    fn transaction_ids(&self, height: u64, _parent_id: Hash) -> Option<(Vec<Hash>, Hash)> {
+        Some((vec![Hash::digest(height.to_be_bytes())], Hash::default()))
     }
 }
 
@@ -354,7 +359,7 @@ impl ConsensusCoordinator {
                 || round.last_proposal_broadcast.elapsed() >= self.config.proposal_rebroadcast)
         {
             if round.proposal.is_none() {
-                let Some(transaction_ids) = self
+                let Some((transaction_ids, fee_commitment)) = self
                     .proposal_source
                     .transaction_ids(height, self.replica.parent_id())
                 else {
@@ -366,6 +371,7 @@ impl ConsensusCoordinator {
                     self.replica.parent_id(),
                     self.id,
                     transaction_ids,
+                    fee_commitment,
                     None,
                 );
                 let signed = SignedProposal::sign(
@@ -409,6 +415,7 @@ impl ConsensusCoordinator {
         {
             let block_id = proposal.proposal.block_id;
             let proposal_transaction_ids = proposal.proposal.transaction_ids.clone();
+            let proposal_fee_commitment = proposal.proposal.fee_commitment;
             if let Some(certificate) = make_certificate(
                 &self.validators,
                 Arc::clone(&self.scheme),
@@ -422,9 +429,15 @@ impl ConsensusCoordinator {
                 self.broadcast(WireMessage::Certificate {
                     certificate: certificate.clone(),
                     transaction_ids: Some(transaction_ids.clone()),
+                    fee_commitment: Some(proposal_fee_commitment),
                 })
                 .await;
-                return self.apply_certificate(&certificate, transaction_ids, round);
+                return self.apply_certificate(
+                    &certificate,
+                    transaction_ids,
+                    proposal_fee_commitment,
+                    round,
+                );
             }
             if !round.has(RoundFlag::PrepareSent)
                 && round.started.elapsed() >= self.config.fast_path_wait
@@ -442,6 +455,7 @@ impl ConsensusCoordinator {
                 self.broadcast(WireMessage::Certificate {
                     certificate: certificate.clone(),
                     transaction_ids: Some(proposal_transaction_ids.clone()),
+                    fee_commitment: Some(proposal_fee_commitment),
                 })
                 .await;
                 self.apply_prepare(&certificate, round).await?;
@@ -459,9 +473,15 @@ impl ConsensusCoordinator {
                 self.broadcast(WireMessage::Certificate {
                     certificate: certificate.clone(),
                     transaction_ids: Some(transaction_ids.clone()),
+                    fee_commitment: Some(proposal_fee_commitment),
                 })
                 .await;
-                return self.apply_certificate(&certificate, transaction_ids, round);
+                return self.apply_certificate(
+                    &certificate,
+                    transaction_ids,
+                    proposal_fee_commitment,
+                    round,
+                );
             }
         }
 
@@ -494,6 +514,7 @@ impl ConsensusCoordinator {
             self.broadcast(WireMessage::Certificate {
                 certificate: certificate.clone(),
                 transaction_ids: None,
+                fee_commitment: None,
             })
             .await;
             self.replica.advance_view(&certificate)?;
@@ -570,6 +591,7 @@ impl ConsensusCoordinator {
             WireMessage::Certificate {
                 certificate,
                 transaction_ids,
+                fee_commitment,
             } => {
                 let expected_sender = if certificate.kind == CertificateKind::Timeout {
                     self.validators
@@ -587,9 +609,9 @@ impl ConsensusCoordinator {
                 if certificate.height != self.replica.height() {
                     return Ok(None);
                 }
-                let certified_transaction_ids = match certificate.kind {
+                let certified_order = match certificate.kind {
                     CertificateKind::Timeout => {
-                        if transaction_ids.is_some() {
+                        if transaction_ids.is_some() || fee_commitment.is_some() {
                             return Err(CoordinatorError::InvalidCertifiedOrder);
                         }
                         None
@@ -597,27 +619,32 @@ impl ConsensusCoordinator {
                     CertificateKind::Fast | CertificateKind::Prepare | CertificateKind::Commit => {
                         let transaction_ids =
                             transaction_ids.ok_or(CoordinatorError::MissingCertifiedOrder)?;
+                        let fee_commitment =
+                            fee_commitment.ok_or(CoordinatorError::MissingCertifiedOrder)?;
                         let expected = Proposal::new(
                             certificate.height,
                             certificate.view,
                             self.replica.parent_id(),
                             expected_sender,
                             transaction_ids.clone(),
+                            fee_commitment,
                             None,
                         );
                         if expected.block_id != certificate.block_id {
                             return Err(CoordinatorError::InvalidCertifiedOrder);
                         }
-                        Some(transaction_ids)
+                        Some((transaction_ids, fee_commitment))
                     }
                 };
                 match certificate.kind {
                     CertificateKind::Prepare => self.apply_prepare(&certificate, round).await?,
                     CertificateKind::Fast | CertificateKind::Commit => {
+                        let (transaction_ids, fee_commitment) =
+                            certified_order.ok_or(CoordinatorError::MissingCertifiedOrder)?;
                         return self.apply_certificate(
                             &certificate,
-                            certified_transaction_ids
-                                .ok_or(CoordinatorError::MissingCertifiedOrder)?,
+                            transaction_ids,
+                            fee_commitment,
                             round,
                         );
                     }
@@ -665,6 +692,7 @@ impl ConsensusCoordinator {
         &mut self,
         certificate: &QuorumCertificate,
         transaction_ids: Vec<Hash>,
+        fee_commitment: Hash,
         round: &mut RoundState,
     ) -> Result<Option<CoordinatorOutcome>, CoordinatorError> {
         if certificate.height != self.replica.height() {
@@ -694,6 +722,7 @@ impl ConsensusCoordinator {
                     height: finalized_height,
                     block_id: finalized_block,
                     transaction_ids,
+                    fee_commitment,
                     certificate: certificate.clone(),
                 })
                 .map_err(|_| CoordinatorError::FinalizedOrderSinkClosed)?;
@@ -710,6 +739,7 @@ impl ConsensusCoordinator {
                 self.replica.parent_id(),
                 self.id,
                 vec![Hash::digest(b"equivocation-a")],
+                Hash::default(),
                 None,
             ),
             &self.private_key,
@@ -722,6 +752,7 @@ impl ConsensusCoordinator {
                 self.replica.parent_id(),
                 self.id,
                 vec![Hash::digest(b"equivocation-b")],
+                Hash::default(),
                 None,
             ),
             &self.private_key,
@@ -959,6 +990,7 @@ pub enum CoordinatorError {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         net::TcpListener as StdTcpListener,
         sync::{Arc, RwLock},
         time::{Duration, SystemTime, UNIX_EPOCH},
@@ -979,11 +1011,11 @@ mod tests {
     struct PipelineSource;
 
     impl ProposalTransactionSource for PipelineSource {
-        fn transaction_ids(&self, height: u64, parent_id: Hash) -> Option<Vec<Hash>> {
+        fn transaction_ids(&self, height: u64, parent_id: Hash) -> Option<(Vec<Hash>, Hash)> {
             let mut bytes = b"real-pipeline-transaction".to_vec();
             bytes.extend_from_slice(&height.to_be_bytes());
             bytes.extend_from_slice(parent_id.as_bytes());
-            Some(vec![Hash::digest(bytes)])
+            Some((vec![Hash::digest(bytes)], Hash::default()))
         }
     }
 
@@ -1254,6 +1286,7 @@ mod tests {
                 equivocation_slash_basis_points: 5_000,
                 validators,
                 initial_objects: Vec::new(),
+                initial_fee_balances: BTreeMap::new(),
             },
             keys,
         )

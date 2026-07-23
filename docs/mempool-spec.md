@@ -8,7 +8,9 @@ Block construction visits scopes in canonical `BTreeMap` order and selects them 
 
 ## Fee settlement
 
-The compute limit reserves eligibility but does not determine payment. Settlement multiplies actual compute consumed by the admitted local base plus priority fee. The payer is debited and the selected validator receives the entire amount. Kestrel has no fee burn in this phase.
+The compute limit reserves eligibility but does not determine payment. Settlement multiplies actual compute consumed by the local base fee plus priority fee. The payer is debited and the selected validator receives the entire amount. Kestrel has no fee burn in this phase.
+
+The settled base fee is the block's leader's choice, not each validator's own locally-recomputed admission-time price — the latter depends on a node's own queue depth and is not guaranteed identical across honest validators. The leader's price is made canonical by folding a commitment to it into the certified block ID itself (see `docs/TECH_DEBT.md` TD-011), so every validator settles the identical amount for the identical committed block.
 
 ## Application sequencing
 

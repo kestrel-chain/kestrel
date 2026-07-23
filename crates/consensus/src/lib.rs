@@ -139,6 +139,14 @@ impl ValidatorSet {
 }
 
 /// Proposal whose transaction hashes define only canonical order, not effects.
+///
+/// `fee_commitment` binds the leader's chosen per-transaction local base fee
+/// (see [`fee_commitment`]) into `block_id` itself, the same way
+/// `transaction_ids` does for ordering. Without this, a leader could send
+/// different honest validators different fee choices for an otherwise
+/// identical, equally-certifiable block, producing a settlement amount that
+/// silently diverges across honest nodes despite everyone agreeing on
+/// `block_id`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Proposal {
     pub height: u64,
@@ -146,6 +154,7 @@ pub struct Proposal {
     pub parent_id: Hash,
     pub proposer: Hash,
     pub transaction_ids: Vec<Hash>,
+    pub fee_commitment: Hash,
     pub justify: Option<Box<QuorumCertificate>>,
     pub block_id: Hash,
 }
@@ -158,15 +167,17 @@ impl Proposal {
         parent_id: Hash,
         proposer: Hash,
         transaction_ids: Vec<Hash>,
+        fee_commitment: Hash,
         justify: Option<QuorumCertificate>,
     ) -> Self {
-        let block_id = proposal_id(height, parent_id, &transaction_ids);
+        let block_id = proposal_id(height, parent_id, &transaction_ids, fee_commitment);
         Self {
             height,
             view,
             parent_id,
             proposer,
             transaction_ids,
+            fee_commitment,
             justify: justify.map(Box::new),
             block_id,
         }
@@ -174,7 +185,13 @@ impl Proposal {
 
     #[must_use]
     pub fn has_valid_id(&self) -> bool {
-        self.block_id == proposal_id(self.height, self.parent_id, &self.transaction_ids)
+        self.block_id
+            == proposal_id(
+                self.height,
+                self.parent_id,
+                &self.transaction_ids,
+                self.fee_commitment,
+            )
     }
 }
 
@@ -1028,6 +1045,7 @@ pub struct FinalizedOrder {
     pub height: u64,
     pub block_id: Hash,
     pub transaction_ids: Vec<Hash>,
+    pub fee_commitment: Hash,
     pub certificate: QuorumCertificate,
 }
 
@@ -1124,14 +1142,35 @@ const fn vote_phase_tag(phase: VotePhase) -> u8 {
     }
 }
 
-fn proposal_id(height: u64, parent_id: Hash, transactions: &[Hash]) -> Hash {
-    let mut bytes = Vec::with_capacity(BLOCK_DOMAIN.len() + 48 + transactions.len() * 32);
+fn proposal_id(height: u64, parent_id: Hash, transactions: &[Hash], fee_commitment: Hash) -> Hash {
+    let mut bytes = Vec::with_capacity(BLOCK_DOMAIN.len() + 80 + transactions.len() * 32);
     bytes.extend_from_slice(BLOCK_DOMAIN);
     bytes.extend_from_slice(&height.to_be_bytes());
     bytes.extend_from_slice(parent_id.as_bytes());
     bytes.extend_from_slice(&(transactions.len() as u64).to_be_bytes());
     for transaction in transactions {
         bytes.extend_from_slice(transaction.as_bytes());
+    }
+    bytes.extend_from_slice(fee_commitment.as_bytes());
+    Hash::digest(bytes)
+}
+
+const FEE_COMMITMENT_DOMAIN: &[u8] = b"kestrel/consensus/fee-commitment/v1";
+
+/// Canonical commitment to a leader's chosen per-transaction local base fee,
+/// in the same order as the block's `transaction_ids`. Folding this into
+/// [`Proposal::block_id`] makes the leader's price choice equivocation-safe:
+/// callers that need a settled base fee (see `crates/node`'s `BlockLifecycle`)
+/// must recompute this from the actual fees they received and compare it
+/// against the certified value rather than trusting an unauthenticated
+/// side-channel.
+#[must_use]
+pub fn fee_commitment(base_fees: &[u128]) -> Hash {
+    let mut bytes = Vec::with_capacity(FEE_COMMITMENT_DOMAIN.len() + 8 + base_fees.len() * 16);
+    bytes.extend_from_slice(FEE_COMMITMENT_DOMAIN);
+    bytes.extend_from_slice(&(base_fees.len() as u64).to_be_bytes());
+    for fee in base_fees {
+        bytes.extend_from_slice(&fee.to_be_bytes());
     }
     Hash::digest(bytes)
 }
@@ -1255,6 +1294,7 @@ mod tests {
             Hash::digest(b"genesis"),
             leader,
             vec![Hash::digest(b"transaction")],
+            Hash::default(),
             None,
         );
         let signed =

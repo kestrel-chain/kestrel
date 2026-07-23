@@ -1,13 +1,17 @@
 //! Validator configuration, deterministic genesis, and operational readiness helpers.
 
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 use consensus::{ConsensusError, SlashingPolicy, Validator, ValidatorSet};
 use crypto::{BLS12381_SCHEME_ID, Bls12381Scheme, CryptoError, ED25519_SCHEME_ID};
 use serde::{Deserialize, Serialize};
 use state::{StateConfig, StateError, StateTree};
 use thiserror::Error;
-use types::{Hash, Object, SchemeId};
+use types::{Address, Hash, Object, SchemeId};
 
 mod coordinator;
 mod lifecycle;
@@ -56,6 +60,11 @@ pub struct GenesisDocument {
     pub equivocation_slash_basis_points: u16,
     pub validators: Vec<GenesisValidator>,
     pub initial_objects: Vec<Object>,
+    /// Fee-ledger balances seeded at genesis, keyed by sender address. Absent
+    /// senders start at a zero balance and must be funded before any of their
+    /// transactions can settle (see `docs/TECH_DEBT.md` TD-011).
+    #[serde(default)]
+    pub initial_fee_balances: BTreeMap<Address, u128>,
 }
 
 /// Validated roots and stake table derived solely from canonical genesis.
@@ -241,6 +250,8 @@ pub enum GenesisError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use consensus::Validator;
     use crypto::{Bls12381Scheme, SignatureScheme};
     use tempfile::TempDir;
@@ -315,6 +326,7 @@ mod tests {
             equivocation_slash_basis_points: 5_000,
             validators,
             initial_objects: objects,
+            initial_fee_balances: BTreeMap::new(),
         }
     }
 }

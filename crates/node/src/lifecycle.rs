@@ -15,12 +15,14 @@ use execution::{
     DeferredExecutionError, DeferredExecutionResult, DeferredExecutor, ExecutableTransaction,
     ExecutionError, OrderedExecutionBlock,
 };
+use mempool::{FeeLedger, Settlement};
 use network::{KestrelCast, KestrelCastConfig, KestrelCastError, Shred};
 use rpc::NodeStatus;
 use serde::{Deserialize, Serialize};
 use state::{StateError, StateSnapshot, StateTree};
 use storage::{KvStore, RocksDbStore, StorageError, WriteBatch};
 use thiserror::Error;
+use tracing::warn;
 use types::{Address, Hash, Transaction};
 
 use crate::{GenesisDocument, GenesisError};
@@ -29,7 +31,7 @@ const CHECKPOINT_KEY: &[u8] = b"application/checkpoint/v1";
 const BLOCK_PREFIX: &[u8] = b"application/block/v1/";
 const PENDING_PREFIX: &[u8] = b"application/pending/v1/";
 const TRANSACTION_ID_DOMAIN: &[u8] = b"kestrel/transaction/id/v1";
-const CHECKPOINT_FORMAT_VERSION: u16 = 1;
+const CHECKPOINT_FORMAT_VERSION: u16 = 2;
 const SIGNED_EXECUTION_MAGIC: [u8; 8] = *b"KSTRTX01";
 
 /// Execution and fee metadata covered by the account signature. Keeping the
@@ -123,11 +125,16 @@ impl TransactionValidator {
 }
 
 /// Signed transaction payload propagated as one erasure-coded block.
+///
+/// `base_fees` is the leader's chosen local base fee per compute unit for
+/// each transaction, in the same order as `transactions` — see
+/// [`Self::fee_commitment`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PropagatedBlock {
     pub height: u64,
     pub parent_id: Hash,
     pub transactions: Vec<Transaction>,
+    pub base_fees: Vec<u128>,
 }
 
 impl PropagatedBlock {
@@ -141,6 +148,16 @@ impl PropagatedBlock {
             .iter()
             .map(signed_transaction_id)
             .collect()
+    }
+
+    /// Commits to the leader's chosen `base_fees`, in the same way
+    /// `transaction_ids` commits to ordering. Folded into
+    /// [`consensus::Proposal::block_id`] so any validator reconstructing this
+    /// payload from shreds can detect a leader that certified one fee choice
+    /// but propagated a different one.
+    #[must_use]
+    pub fn fee_commitment(&self) -> Hash {
+        consensus::fee_commitment(&self.base_fees)
     }
 
     /// Encodes this payload into independently integrity-checked `KestrelCast` shreds.
@@ -192,7 +209,19 @@ struct DurableCheckpoint {
     finalized_height: u64,
     finalized_block: Hash,
     next_nonces: BTreeMap<Address, u64>,
+    fee_balances: BTreeMap<Address, u128>,
     state: StateSnapshot,
+}
+
+/// One admitted transaction's executable payload plus the fee data needed to
+/// settle it deterministically at commit time: `base_fee_per_compute` is the
+/// leader's certified local base fee (see [`PropagatedBlock::fee_commitment`]),
+/// and `priority_fee_per_compute` is the sender's own signed bid.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct PendingTransactionExecution {
+    executable: ExecutableTransaction,
+    base_fee_per_compute: u128,
+    priority_fee_per_compute: u128,
 }
 
 /// A finalized order already handed to the deferred executor but not yet
@@ -205,7 +234,7 @@ struct PendingBlock {
     parent_id: Hash,
     payload_id: Hash,
     next_nonces: BTreeMap<Address, u64>,
-    transactions: Vec<ExecutableTransaction>,
+    transactions: Vec<PendingTransactionExecution>,
 }
 
 /// Restart-safe finalized-block execution and application-state commit pipeline.
@@ -225,6 +254,7 @@ pub struct BlockLifecycle {
     admission_nonces: BTreeMap<Address, u64>,
     pending: BTreeMap<u64, PendingBlock>,
     completed: Option<DeferredExecutionResult>,
+    fee_ledger: FeeLedger,
 }
 
 impl BlockLifecycle {
@@ -267,11 +297,13 @@ impl BlockLifecycle {
                 finalized_height: 0,
                 finalized_block: validated.genesis_hash,
                 next_nonces: BTreeMap::new(),
+                fee_balances: genesis.initial_fee_balances.clone(),
                 state: state.durable_snapshot()?,
             };
             store.put(CHECKPOINT_KEY, &canonical_bytes(&checkpoint)?)?;
             checkpoint
         };
+        let fee_ledger = FeeLedger::from_balances(checkpoint.fee_balances.clone());
         let state = StateTree::from_durable_snapshot(checkpoint.state.clone())?;
         {
             let mut shared = rpc_state
@@ -315,7 +347,11 @@ impl BlockLifecycle {
                 height: record.order.height,
                 consensus_block_id: record.order.block_id,
                 transaction_ids: record.order.transaction_ids.clone(),
-                transactions: record.transactions.clone(),
+                transactions: record
+                    .transactions
+                    .iter()
+                    .map(|execution| execution.executable.clone())
+                    .collect(),
             })?;
             submitted_height = record.order.height;
             submitted_block = record.order.block_id;
@@ -338,6 +374,7 @@ impl BlockLifecycle {
             admission_nonces,
             pending,
             completed: None,
+            fee_ledger,
         })
     }
 
@@ -382,24 +419,44 @@ impl BlockLifecycle {
             return Err(LifecycleError::OrderMismatch);
         }
 
+        if payload.base_fees.len() != payload.transactions.len() {
+            return Err(LifecycleError::FeeCountMismatch);
+        }
         let mut next_nonces = self.admission_nonces.clone();
         let mut transaction_ids = Vec::with_capacity(payload.transactions.len());
-        let mut executable = Vec::with_capacity(payload.transactions.len());
-        for transaction in &payload.transactions {
-            let (id, decoded) = admit(transaction, &self.admission, &mut next_nonces)?;
+        let mut executions = Vec::with_capacity(payload.transactions.len());
+        for (transaction, &base_fee_per_compute) in
+            payload.transactions.iter().zip(&payload.base_fees)
+        {
+            let (id, signed) = admit(transaction, &self.admission, &mut next_nonces)?;
+            let required_fee_per_compute = base_fee_per_compute
+                .checked_add(signed.priority_fee_per_compute)
+                .ok_or(LifecycleError::FeeCapExceeded)?;
+            if signed.max_fee_per_compute < required_fee_per_compute {
+                return Err(LifecycleError::FeeCapExceeded);
+            }
             transaction_ids.push(id);
-            executable.push(decoded);
+            executions.push(PendingTransactionExecution {
+                executable: signed.executable,
+                base_fee_per_compute,
+                priority_fee_per_compute: signed.priority_fee_per_compute,
+            });
         }
+        let fee_commitment = payload.fee_commitment();
         let expected_block = Proposal::new(
             payload.height,
             0,
             payload.parent_id,
             Hash::default(),
             transaction_ids.clone(),
+            fee_commitment,
             None,
         )
         .block_id;
-        if transaction_ids != order.transaction_ids || expected_block != order.block_id {
+        if transaction_ids != order.transaction_ids
+            || fee_commitment != order.fee_commitment
+            || expected_block != order.block_id
+        {
             return Err(LifecycleError::OrderMismatch);
         }
         let payload_id = payload.payload_id()?;
@@ -409,7 +466,7 @@ impl BlockLifecycle {
             parent_id: payload.parent_id,
             payload_id,
             next_nonces,
-            transactions: executable,
+            transactions: executions,
         };
         // Durably record the block before handing it to the executor so a
         // crash never strands a validated, in-flight block: on restart the
@@ -421,7 +478,11 @@ impl BlockLifecycle {
             height,
             consensus_block_id: pending.order.block_id,
             transaction_ids,
-            transactions: pending.transactions.clone(),
+            transactions: pending
+                .transactions
+                .iter()
+                .map(|execution| execution.executable.clone())
+                .collect(),
         }) {
             let _ = self.store.delete(&pending_key(height));
             return Err(error.into());
@@ -438,6 +499,7 @@ impl BlockLifecycle {
     /// # Errors
     ///
     /// Returns worker, execution, ordering, checkpoint, persistence, or lock failures.
+    #[allow(clippy::too_many_lines)] // Keep the commit/settlement/persistence timeline auditable.
     pub fn poll_commit(&mut self) -> Result<Option<DurableBlockRecord>, LifecycleError> {
         if self.completed.is_none() {
             self.completed = self.executor.try_result()?;
@@ -475,12 +537,48 @@ impl BlockLifecycle {
             state_root: snapshot.state_root,
             certificate: pending.order.certificate.clone(),
         };
+        // Settle actual compute against the certified local base fee plus
+        // each sender's own signed priority bid, crediting the validator that
+        // led this height. A settlement failure (e.g. an unfunded payer) does
+        // not unwind an already-finalized, already-executed block — it is
+        // only ever logged.
+        let leader = self
+            .validators
+            .leader(pending.order.height, pending.order.certificate.view);
+        let leader_address = self.scheme.address(&leader.public_key)?;
+        for receipt in &result.receipts {
+            let (Some(execution), Some(&transaction_id)) = (
+                pending.transactions.get(receipt.transaction_index),
+                pending.order.transaction_ids.get(receipt.transaction_index),
+            ) else {
+                continue;
+            };
+            let settlement = Settlement {
+                transaction_id,
+                payer: execution.executable.operation.sender(),
+                compute_limit: execution.executable.compute_limit,
+                local_base_fee_per_compute: execution.base_fee_per_compute,
+                priority_fee_per_compute: execution.priority_fee_per_compute,
+            };
+            if let Err(error) =
+                self.fee_ledger
+                    .settle(&settlement, receipt.compute_used, leader_address)
+            {
+                warn!(
+                    %error,
+                    height = record.height,
+                    %transaction_id,
+                    "fee settlement failed; block commit proceeds unaffected"
+                );
+            }
+        }
         let checkpoint = DurableCheckpoint {
             format_version: CHECKPOINT_FORMAT_VERSION,
             genesis_hash: self.genesis_hash,
             finalized_height: record.height,
             finalized_block: record.consensus_block_id,
             next_nonces: pending.next_nonces.clone(),
+            fee_balances: self.fee_ledger.balances().clone(),
             state: snapshot.clone(),
         };
         let mut batch = WriteBatch::new();
@@ -544,6 +642,12 @@ impl BlockLifecycle {
         self.admission_nonces.clone()
     }
 
+    /// Returns `address`'s durable fee-ledger balance.
+    #[must_use]
+    pub fn fee_balance(&self, address: Address) -> u128 {
+        self.fee_ledger.balance(address)
+    }
+
     /// Shares this node's single durable store with other components (the
     /// Stage 2 pipeline's pre-consensus admission log) instead of opening a
     /// second `RocksDB` instance for the same process.
@@ -557,7 +661,7 @@ fn admit(
     transaction: &Transaction,
     validator: &TransactionValidator,
     nonces: &mut BTreeMap<Address, u64>,
-) -> Result<(Hash, ExecutableTransaction), LifecycleError> {
+) -> Result<(Hash, SignedExecutionPayload), LifecycleError> {
     let (id, payload) = validator.validate(transaction)?;
     let expected = nonces.get(&transaction.sender).copied().unwrap_or_default();
     if transaction.nonce != expected {
@@ -566,14 +670,13 @@ fn admit(
             received: transaction.nonce,
         });
     }
-    let executable = payload.executable;
     nonces.insert(
         transaction.sender,
         expected
             .checked_add(1)
             .ok_or(LifecycleError::NonceOverflow)?,
     );
-    Ok((id, executable))
+    Ok((id, payload))
 }
 
 /// Returns the canonical ID of a complete signed transaction envelope.
@@ -664,4 +767,8 @@ pub enum LifecycleError {
     LockPoisoned,
     #[error("durable pending-block log is corrupt: expected height {expected}, found {found}")]
     PendingReplayGap { expected: u64, found: u64 },
+    #[error("propagated block's base fee count does not match its transaction count")]
+    FeeCountMismatch,
+    #[error("declared local base fee does not fit the transaction's signed fee cap")]
+    FeeCapExceeded,
 }

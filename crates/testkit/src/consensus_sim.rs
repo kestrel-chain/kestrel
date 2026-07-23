@@ -213,6 +213,7 @@ fn attempt_view(
         parent_id,
         leader,
         transaction_ids.to_vec(),
+        Hash::default(),
         None,
     );
     let first_round =

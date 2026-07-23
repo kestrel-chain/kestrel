@@ -185,48 +185,6 @@ Priority meanings:
   deterministic dependency/retry scheduling, version reclamation, cross-block
   lifecycle rules, and an evidence-based adaptive hot-key fallback.
 
-### TD-011 — Move gas metering and fee settlement are not integrated
-
-- **Priority:** Medium; narrowed from High. Gas metering itself is now real,
-  deterministic, and enforced everywhere execution runs. Fee settlement
-  (charging the metered amount and crediting a validator) is not yet wired
-  into the live node pipeline.
-- **Introduced:** Phase 1 explicit deferral; Phase 5 added a separate fee
-  ledger; gas metering closed post-Phase-6. Sources: `phase-1-status.md`,
-  `mempool-spec.md`, `crates/vm-move/src/lib.rs`, `crates/execution/src/lib.rs`.
-- **Why deferred/exposed:** `MoveVmHost::publish_module`/`execute_entry_function`
-  now meter real Move bytecode via `move-vm-test-utils`'s reference `GasStatus`
-  and `INITIAL_COST_SCHEDULE` (the same per-instruction cost table used
-  upstream) instead of `UnmeteredGasMeter`, bounded by a caller-supplied
-  `gas_limit`; exceeding it aborts atomically with `MoveHostError::OutOfGas`
-  and leaves state unchanged (verified by a dedicated test). Native object
-  primitives (create/mutate/delete/transfer/resurrect), which bypass the Move
-  VM entirely, are charged a flat `NATIVE_OPERATION_COMPUTE_COST` checked
-  against the same limit. `ExecutableTransaction.compute_limit` is now the
-  single source of truth for this budget (the redundant
-  `SignedExecutionPayload.compute_limit` field was removed), and real
-  consumed-compute values now flow out through `MoveExecutionResult`,
-  `OperationResult`, `ExecutionReceipt`, and `DeferredExecutionResult` —
-  available per transaction, not fabricated. The
-  parallel-vs-sequential state-root equivalence property (the codebase's most
-  important correctness invariant) was re-verified with metering enabled and
-  still holds. What remains unwired: `mempool::FeeLedger::settle` (debit payer,
-  credit validator, enforce compute-limit conservation) is fully implemented
-  but still only exercised by the mempool crate's own unit tests — nothing in
-  `BlockLifecycle`/`Stage2Pipeline` calls it with the now-real per-transaction
-  `compute_used`, there is no genesis mechanism to fund a payer's `FeeLedger`
-  balance, and `FeeLedger` balances are not durably persisted. `vm-evm`'s own
-  gas handling (hardcoded `gas_limit`/zero `gas_price`, discarded `gas_used`)
-  is unaffected by this and remains a separate, fully decoupled sub-problem
-  (see TD-016).
-- **Expected resolution:** Retain per-transaction fee-bid metadata from mempool
-  selection through to block commit, have `Stage2Pipeline` own a `FeeLedger`
-  and call `settle()` for each committed transaction crediting that height's
-  leader, add a genesis-level initial-balance mechanism for testability, persist
-  `FeeLedger` balances durably (shared scope with TD-012), and ensure a
-  settlement failure (e.g. insufficient payer balance) is logged rather than
-  rejecting an already-finalized, already-executed block.
-
 ### TD-012 — State synchronization, in-flight recovery, and pruning are incomplete
 
 - **Priority:** High; narrowed. Both in-flight recovery gaps identified in the
@@ -470,6 +428,19 @@ historical snapshots, but they are not open debt in their original form:
   and calling Move `transfer` against the EVM-updated resource.
 - TD-010 was closed by making resurrection return a root-free transition; the
   block executors remain the sole final-root computation point.
+- TD-011 was closed by wiring `mempool::FeeLedger::settle` into
+  `BlockLifecycle::poll_commit` for every committed transaction's real
+  `compute_used`. The subtlety was determinism: a locally-recomputed base fee
+  could differ across honest validators (it depends on each node's own mempool
+  queue depth), so settlement instead uses the leader's price, made canonical
+  by folding a new `fee_commitment` into `consensus::Proposal::block_id` itself
+  — certified by the same quorum vote as transaction order, not trusted out of
+  band. `PropagatedBlock` carries the leader's `base_fees` over gossip;
+  `BlockLifecycle::submit_payload` rejects any payload whose recomputed
+  commitment doesn't match the certified one (`OrderMismatch`) or whose base
+  fee would exceed a sender's signed cap (`FeeCapExceeded`). Genesis can seed
+  starting balances (`initial_fee_balances`), and `FeeLedger` balances persist
+  in the same durable checkpoint as nonces/state.
 - TD-022 was closed by enforcing mutually exclusive order/timeout first-round
   votes. Selective-delivery production-code and multi-process equivocation tests
   cover the previously unsafe trace under the strict less-than-20% bound.

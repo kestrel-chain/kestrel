@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use std::{
+    collections::BTreeMap,
     fs,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
@@ -303,6 +304,7 @@ fn fixture_genesis() -> (
             equivocation_slash_basis_points: 5_000,
             validators,
             initial_objects: Vec::new(),
+            initial_fee_balances: BTreeMap::new(),
         },
         keys,
         gossip_identities,

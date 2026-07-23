@@ -221,6 +221,7 @@ fn prepared_lock_rejects_a_conflicting_proposal() {
         parent,
         replica.leader(),
         vec![Hash::digest(b"conflict")],
+        Hash::default(),
         None,
     );
     assert_eq!(
@@ -249,6 +250,7 @@ fn honest_replica_refuses_same_view_equivocation() {
         Hash::digest(b"parent"),
         leader,
         vec![Hash::digest(b"first")],
+        Hash::default(),
         None,
     );
     let second = Proposal::new(
@@ -257,6 +259,7 @@ fn honest_replica_refuses_same_view_equivocation() {
         Hash::digest(b"parent"),
         leader,
         vec![Hash::digest(b"second")],
+        Hash::default(),
         None,
     );
     replica.vote_for_proposal(&first).unwrap();
@@ -355,6 +358,7 @@ fn fast_certificate_signers_cannot_abandon_the_view_and_finalize_a_conflict() {
         parent,
         fixture.validators.leader(7, 0).id,
         vec![Hash::digest(b"fast-a")],
+        Hash::default(),
         None,
     );
     let mut replicas = fixture
@@ -428,6 +432,7 @@ fn timeout_vote_prevents_a_later_order_vote_in_the_same_view() {
         parent,
         replica.leader(),
         vec![Hash::digest(b"late-proposal")],
+        Hash::default(),
         None,
     );
     assert_eq!(

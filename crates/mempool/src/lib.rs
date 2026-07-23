@@ -37,6 +37,20 @@ pub struct PendingTransaction {
     pub local_base_fee_per_compute: u128,
 }
 
+impl PendingTransaction {
+    /// Extracts just the fields [`FeeLedger::settle`] needs.
+    #[must_use]
+    pub fn settlement(&self) -> Settlement {
+        Settlement {
+            transaction_id: self.transaction.id,
+            payer: self.transaction.sender,
+            compute_limit: self.transaction.compute_limit,
+            local_base_fee_per_compute: self.local_base_fee_per_compute,
+            priority_fee_per_compute: self.transaction.priority_fee_per_compute,
+        }
+    }
+}
+
 /// Application-supplied deterministic ordering rule for one target scope.
 pub trait OrderingPolicy: Send + Sync {
     /// Returns the preferred order. Implementations must be total and deterministic.
@@ -288,6 +302,18 @@ pub struct FeeLedger {
 }
 
 impl FeeLedger {
+    /// Restores a ledger from durably persisted or genesis-seeded balances.
+    #[must_use]
+    pub const fn from_balances(balances: BTreeMap<Address, u128>) -> Self {
+        Self { balances }
+    }
+
+    /// Returns the full balance table for durable persistence.
+    #[must_use]
+    pub fn balances(&self) -> &BTreeMap<Address, u128> {
+        &self.balances
+    }
+
     /// Credits `amount` to `address`.
     ///
     /// # Errors
@@ -314,21 +340,21 @@ impl FeeLedger {
     /// Rejects excess compute, arithmetic overflow, or insufficient payer balance.
     pub fn settle(
         &mut self,
-        pending: &PendingTransaction,
+        settlement: &Settlement,
         actual_compute: u64,
         validator: Address,
     ) -> Result<FeeReceipt, MempoolError> {
-        if actual_compute > pending.transaction.compute_limit {
+        if actual_compute > settlement.compute_limit {
             return Err(MempoolError::ComputeLimitExceeded);
         }
-        let unit_price = pending
+        let unit_price = settlement
             .local_base_fee_per_compute
-            .checked_add(pending.transaction.priority_fee_per_compute)
+            .checked_add(settlement.priority_fee_per_compute)
             .ok_or(MempoolError::FeeOverflow)?;
         let charged = unit_price
             .checked_mul(u128::from(actual_compute))
             .ok_or(MempoolError::FeeOverflow)?;
-        let payer = pending.transaction.sender;
+        let payer = settlement.payer;
         let payer_balance = self
             .balances
             .get(&payer)
@@ -346,14 +372,29 @@ impl FeeLedger {
             self.balances.insert(validator, credited);
         }
         Ok(FeeReceipt {
-            transaction_id: pending.transaction.id,
-            payer: pending.transaction.sender,
+            transaction_id: settlement.transaction_id,
+            payer,
             validator,
             actual_compute,
             unit_price,
             charged,
         })
     }
+}
+
+/// Minimal per-transaction data needed to settle a metered fee, decoupled from
+/// [`PendingTransaction`] (the mempool's own admission-scoped record) so
+/// callers that never build one — e.g. `node::BlockLifecycle`, which learns
+/// the certified base fee from a committed block rather than from live
+/// mempool admission — can settle directly from the fields this actually
+/// uses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Settlement {
+    pub transaction_id: Hash,
+    pub payer: Address,
+    pub compute_limit: u64,
+    pub local_base_fee_per_compute: u128,
+    pub priority_fee_per_compute: u128,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -488,7 +529,7 @@ mod tests {
         let pending = pool.submit_and_select(transaction_with_sender(1, object, 3, payer));
         let mut ledger = FeeLedger::default();
         ledger.credit(payer, 1_000).unwrap();
-        let receipt = ledger.settle(&pending, 10, validator).unwrap();
+        let receipt = ledger.settle(&pending.settlement(), 10, validator).unwrap();
         assert_eq!(receipt.unit_price, 5);
         assert_eq!(receipt.charged, 50);
         assert_eq!(ledger.balance(payer), 950);
@@ -508,7 +549,7 @@ mod tests {
         ledger.credit(validator, u128::MAX).unwrap();
 
         assert_eq!(
-            ledger.settle(&pending, 10, validator),
+            ledger.settle(&pending.settlement(), 10, validator),
             Err(MempoolError::FeeOverflow)
         );
         assert_eq!(ledger.balance(payer), 1_000);

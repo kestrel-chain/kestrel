@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, OpenOptions},
     io::Write,
     path::Path,
@@ -100,6 +101,7 @@ fn genesis_create(arguments: &[String]) -> Result<()> {
         equivocation_slash_basis_points: 5_000,
         validators,
         initial_objects: Vec::new(),
+        initial_fee_balances: BTreeMap::new(),
     };
     document.write_json(&arguments[3])?;
     let validated = document.validate()?;

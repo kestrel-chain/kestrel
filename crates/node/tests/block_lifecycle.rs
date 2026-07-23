@@ -9,11 +9,14 @@ use consensus::{
     CertificateKind, FinalizedOrder, Proposal, Validator, Vote, VoteCollector, VotePhase,
 };
 use crypto::{AggregateSignatureScheme, Bls12381Scheme, Ed25519Scheme, SignatureScheme};
-use execution::{AccessMode, DeclaredObjectRef, ExecutableTransaction, MoveOperation};
+use execution::{
+    AccessMode, DeclaredObjectRef, ExecutableTransaction, MoveOperation,
+    NATIVE_OPERATION_COMPUTE_COST,
+};
 use network::KestrelCastConfig;
 use node::{
     BlockLifecycle, GENESIS_FORMAT_VERSION, GenesisDocument, GenesisValidator, LifecycleError,
-    PropagatedBlock,
+    PropagatedBlock, SignedExecutionPayload,
 };
 use rpc::NodeStatus;
 use state::{StateConfig, StateTree};
@@ -42,6 +45,7 @@ fn reconstructed_signed_block_executes_commits_and_restores_after_restart() {
             signed_mutation(&account_key, &account_public_key, owner, 0, &first, 0, 11),
             signed_mutation(&account_key, &account_public_key, owner, 1, &second, 0, 12),
         ],
+        base_fees: vec![0, 0],
     };
     let first_order = finalized_order(&genesis, &validator_keys, &first_payload);
     let shreds = first_payload.shreds(KestrelCastConfig::default()).unwrap();
@@ -69,6 +73,7 @@ fn reconstructed_signed_block_executes_commits_and_restores_after_restart() {
                 0,
                 99,
             )],
+            base_fees: vec![0],
         };
         let invalid_order = finalized_order(&genesis, &validator_keys, &invalid_payload);
         assert!(matches!(
@@ -120,6 +125,7 @@ fn reconstructed_signed_block_executes_commits_and_restores_after_restart() {
             1,
             21,
         )],
+        base_fees: vec![0],
     };
     let second_order = finalized_order(&genesis, &validator_keys, &second_payload);
     lifecycle
@@ -164,6 +170,7 @@ fn rent_epoch_advances_automatically_and_survives_restart() {
                 height,
                 parent_id,
                 transactions: Vec::new(),
+                base_fees: Vec::new(),
             };
             let order = finalized_order(&genesis, &validator_keys, &payload);
             lifecycle.submit_payload(order, &payload).unwrap();
@@ -216,6 +223,7 @@ fn rent_epoch_advances_automatically_and_survives_restart() {
             height,
             parent_id,
             transactions: Vec::new(),
+            base_fees: Vec::new(),
         };
         let order = finalized_order(&genesis, &validator_keys, &payload);
         lifecycle.submit_payload(order, &payload).unwrap();
@@ -252,6 +260,7 @@ fn finalized_block_submitted_before_a_crash_still_commits_after_restart() {
             0,
             42,
         )],
+        base_fees: vec![0],
     };
     let order = finalized_order(&genesis, &validator_keys, &payload);
 
@@ -289,6 +298,167 @@ fn finalized_block_submitted_before_a_crash_still_commits_after_restart() {
         shared_state.read().unwrap().object(&first.id).unwrap().data,
         vec![42]
     );
+}
+
+#[test]
+fn committed_transaction_fee_is_debited_from_payer_and_credited_to_the_leader() {
+    let directory = TempDir::new().unwrap();
+    let account_key = [11_u8; 32];
+    let account_scheme = Ed25519Scheme;
+    let account_public_key = account_scheme.public_key(&account_key).unwrap();
+    let owner = account_scheme.address(&account_public_key).unwrap();
+    let first = object(1, owner);
+    let (mut genesis, validator_keys) = genesis(vec![first.clone()]);
+    genesis.initial_fee_balances.insert(owner, 10_000);
+    let validated = genesis.validate().unwrap();
+    let leader = validated.validators.leader(1, 0);
+    let leader_address = Bls12381Scheme.address(&leader.public_key).unwrap();
+    let status = status(&genesis, validated.genesis_hash, validated.state_root);
+    let shared_state = Arc::new(RwLock::new(StateTree::new(StateConfig::default()).unwrap()));
+
+    // priority fee 2 + leader-declared base fee 3 = unit price 5; native
+    // object primitives always charge exactly `NATIVE_OPERATION_COMPUTE_COST`.
+    let payload = PropagatedBlock {
+        height: 1,
+        parent_id: validated.genesis_hash,
+        transactions: vec![signed_mutation_with_fee_bid(
+            &account_key,
+            &account_public_key,
+            owner,
+            0,
+            &first,
+            0,
+            42,
+            10,
+            2,
+        )],
+        base_fees: vec![3],
+    };
+    let order = finalized_order(&genesis, &validator_keys, &payload);
+
+    let mut lifecycle = BlockLifecycle::open(
+        &genesis,
+        directory.path(),
+        Arc::clone(&status),
+        Arc::clone(&shared_state),
+        100,
+        4,
+    )
+    .unwrap();
+    lifecycle.submit_payload(order, &payload).unwrap();
+    wait_for_commit(&mut lifecycle);
+
+    let expected_charge = 5_u128 * u128::from(NATIVE_OPERATION_COMPUTE_COST);
+    assert_eq!(lifecycle.fee_balance(owner), 10_000 - expected_charge);
+    assert_eq!(lifecycle.fee_balance(leader_address), expected_charge);
+}
+
+#[test]
+fn base_fee_that_does_not_match_the_certified_commitment_is_rejected() {
+    let directory = TempDir::new().unwrap();
+    let account_key = [12_u8; 32];
+    let account_scheme = Ed25519Scheme;
+    let account_public_key = account_scheme.public_key(&account_key).unwrap();
+    let owner = account_scheme.address(&account_public_key).unwrap();
+    let first = object(1, owner);
+    let (mut genesis, validator_keys) = genesis(vec![first.clone()]);
+    genesis.initial_fee_balances.insert(owner, 10_000);
+    let validated = genesis.validate().unwrap();
+    let status = status(&genesis, validated.genesis_hash, validated.state_root);
+    let shared_state = Arc::new(RwLock::new(StateTree::new(StateConfig::default()).unwrap()));
+
+    let payload = PropagatedBlock {
+        height: 1,
+        parent_id: validated.genesis_hash,
+        transactions: vec![signed_mutation_with_fee_bid(
+            &account_key,
+            &account_public_key,
+            owner,
+            0,
+            &first,
+            0,
+            42,
+            10,
+            2,
+        )],
+        base_fees: vec![3],
+    };
+    // Certify against the real base fee, then propagate a payload claiming a
+    // different one for the same certified block. A leader (or a corrupt
+    // shred reconstruction) must not be able to silently change the settled
+    // amount after the certificate is formed.
+    let order = finalized_order(&genesis, &validator_keys, &payload);
+    // 1 (instead of the certified 3) still clears the signed fee cap of 10
+    // (1 + priority 2 = 3), so this exercises the commitment mismatch itself
+    // rather than tripping the separate fee-cap check first.
+    let tampered_payload = PropagatedBlock {
+        base_fees: vec![1],
+        ..payload
+    };
+
+    let mut lifecycle = BlockLifecycle::open(
+        &genesis,
+        directory.path(),
+        Arc::clone(&status),
+        Arc::clone(&shared_state),
+        100,
+        4,
+    )
+    .unwrap();
+    assert!(matches!(
+        lifecycle.submit_payload(order, &tampered_payload),
+        Err(LifecycleError::OrderMismatch)
+    ));
+}
+
+#[allow(clippy::too_many_arguments)] // Every argument is a distinct signed-payload/fee-bid field.
+fn signed_mutation_with_fee_bid(
+    private_key: &[u8],
+    public_key: &[u8],
+    sender: Address,
+    nonce: u64,
+    object: &Object,
+    expected_version: u64,
+    data: u8,
+    max_fee_per_compute: u128,
+    priority_fee_per_compute: u128,
+) -> Transaction {
+    let executable = ExecutableTransaction {
+        operation: MoveOperation::MutateObject {
+            sender,
+            id: object.id,
+            expected_version,
+            replacement: Object {
+                version: expected_version,
+                data: vec![data],
+                ..object.clone()
+            },
+        },
+        object_references: vec![DeclaredObjectRef {
+            id: object.id,
+            owner: Owner::Single(sender),
+            access: AccessMode::Write,
+        }],
+        compute_limit: 1_000,
+    };
+    let payload = SignedExecutionPayload::new(
+        executable,
+        max_fee_per_compute,
+        priority_fee_per_compute,
+        Vec::new(),
+    );
+    let mut transaction = Transaction {
+        sender,
+        nonce,
+        payload: bcs::to_bytes(&payload).unwrap(),
+        scheme_id: 1,
+        public_key: public_key.to_vec(),
+        signature: Vec::new(),
+    };
+    transaction.signature = Ed25519Scheme
+        .sign(private_key, &transaction.signing_message())
+        .unwrap();
+    transaction
 }
 
 fn wait_for_commit(lifecycle: &mut BlockLifecycle) -> node::DurableBlockRecord {
@@ -356,6 +526,7 @@ fn finalized_order(
         payload.parent_id,
         validated.validators.leader(payload.height, 0).id,
         transaction_ids.clone(),
+        payload.fee_commitment(),
         None,
     );
     let scheme: Arc<dyn AggregateSignatureScheme> = Arc::new(Bls12381Scheme);
@@ -390,6 +561,7 @@ fn finalized_order(
         height: payload.height,
         block_id: proposal.block_id,
         transaction_ids,
+        fee_commitment: proposal.fee_commitment,
         certificate: certificate.unwrap(),
     }
 }
@@ -431,6 +603,7 @@ fn genesis(initial_objects: Vec<Object>) -> (GenesisDocument, BTreeMap<Hash, Vec
             equivocation_slash_basis_points: 5_000,
             validators,
             initial_objects,
+            initial_fee_balances: BTreeMap::new(),
         },
         keys,
     )
