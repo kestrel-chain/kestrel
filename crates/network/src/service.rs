@@ -458,8 +458,8 @@ mod tests {
         assert_eq!(shred_receiver.try_recv().unwrap(), (peer, shred, false));
     }
 
-    #[test]
-    fn tcp_noise_yamux_swarm_builds() {
+    #[tokio::test]
+    async fn tcp_noise_yamux_swarm_builds() {
         let swarm = super::build_swarm(
             libp2p::identity::Keypair::generate_ed25519(),
             &super::GossipConfig::default(),
