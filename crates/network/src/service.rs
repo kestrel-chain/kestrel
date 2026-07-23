@@ -11,7 +11,8 @@ use libp2p::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
+use types::Hash;
 
 use crate::Shred;
 
@@ -23,6 +24,26 @@ const SHRED_PROTOCOL: &str = "/kestrel/shreds/1";
 pub struct ConfiguredPeer {
     pub peer_id: PeerId,
     pub address: Multiaddr,
+}
+
+/// Operator-controlled fault injection on this node's libp2p transaction and
+/// shred paths, mirroring `node::CoordinatorFaults` for the raw-TCP consensus
+/// path (TD-003). All fields are disabled by default. Drops are deterministic
+/// in the message payload, so a given transaction or shred is either always or
+/// never dropped by a given node, keeping fault scenarios reproducible.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NetworkFaults {
+    /// Delay applied before each outbound transaction publish and shred send on
+    /// this node, modelling added link latency. Because a single task drives
+    /// the swarm, this also stalls that node's other network processing for the
+    /// delay — an intentional "slow node" model, not a per-link queue.
+    pub outbound_delay: Duration,
+    /// Fraction of this node's outbound transaction publishes dropped, in basis
+    /// points (0..=10000). 10000 silences its transaction gossip entirely.
+    pub transaction_drop_basis_points: u16,
+    /// Fraction of this node's outbound shred sends dropped, in basis points
+    /// (0..=10000). 10000 models a fully dead relay/leader shred path on it.
+    pub shred_drop_basis_points: u16,
 }
 
 /// Independent bandwidth/queue settings for transaction and shred propagation.
@@ -37,6 +58,7 @@ pub struct GossipConfig {
     pub transaction_max_bytes: usize,
     pub shred_max_bytes: usize,
     pub heartbeat_interval: Duration,
+    pub faults: NetworkFaults,
 }
 
 impl Default for GossipConfig {
@@ -52,7 +74,16 @@ impl Default for GossipConfig {
             inbound_shred_capacity: 16_384,
             transaction_max_bytes: 512 * 1024,
             shred_max_bytes: 2 * 1024 * 1024,
-            heartbeat_interval: Duration::from_millis(100),
+            // Profiling the real pipeline (docs/TECH_DEBT.md TD-003 tooling)
+            // found the first block after a burst of admissions was reliably
+            // empty in 15/15 trials: with round-robin leadership, the next
+            // height after submission is almost never led by the validator
+            // that admitted the transaction, so it depends on gossip to reach
+            // the other validators' mempools before their proposal is built.
+            // 100ms was large enough to reliably miss that window; the test
+            // suite already exercises 25ms successfully.
+            heartbeat_interval: Duration::from_millis(25),
+            faults: NetworkFaults::default(),
         }
     }
 }
@@ -230,7 +261,10 @@ impl NetworkNode {
             ban_receiver,
             inbound_transaction_sender,
             inbound_shred_sender,
-            config.shred_max_bytes,
+            RunConfig {
+                shred_max_bytes: config.shred_max_bytes,
+                faults: config.faults,
+            },
         ));
         Ok(Self {
             local_peer_id,
@@ -312,6 +346,13 @@ impl Behaviour {
     }
 }
 
+/// Static per-run delivery settings for the network loop, grouped to keep
+/// `run`'s parameter list within bounds.
+struct RunConfig {
+    shred_max_bytes: usize,
+    faults: NetworkFaults,
+}
+
 async fn run(
     mut swarm: Swarm<Behaviour>,
     mut transaction_receiver: mpsc::Receiver<Vec<u8>>,
@@ -319,15 +360,38 @@ async fn run(
     mut ban_receiver: mpsc::Receiver<PeerId>,
     inbound_transaction_sender: mpsc::Sender<InboundTransaction>,
     inbound_shred_sender: mpsc::Sender<InboundShred>,
-    shred_max_bytes: usize,
+    config: RunConfig,
 ) {
+    let RunConfig {
+        shred_max_bytes,
+        faults,
+    } = config;
     let transaction_topic = IdentTopic::new(TRANSACTION_TOPIC);
+    let local_bytes = swarm.local_peer_id().to_bytes();
     loop {
         tokio::select! {
             Some(transaction) = transaction_receiver.recv() => {
+                if deterministic_drop(
+                    faults.transaction_drop_basis_points,
+                    &[&local_bytes, &transaction],
+                ) {
+                    continue;
+                }
+                if !faults.outbound_delay.is_zero() {
+                    sleep(faults.outbound_delay).await;
+                }
                 let _ = swarm.behaviour_mut().transaction_gossip.publish(transaction_topic.clone(), transaction);
             }
             Some((peer, shred, relay_requested)) = shred_receiver.recv() => {
+                if deterministic_drop(
+                    faults.shred_drop_basis_points,
+                    &[&local_bytes, &peer.to_bytes(), &shred.payload],
+                ) {
+                    continue;
+                }
+                if !faults.outbound_delay.is_zero() {
+                    sleep(faults.outbound_delay).await;
+                }
                 swarm.behaviour_mut().shred_exchange.send_request(
                     &peer,
                     ShredRequest { shred, relay_requested },
@@ -378,6 +442,22 @@ async fn run(
     }
 }
 
+/// Deterministically decides whether to drop a message, sampling a stable hash
+/// of the seed parts so the same message is either always or never dropped by a
+/// given node. Mirrors `ConsensusCoordinator::should_drop` for the raw-TCP path.
+fn deterministic_drop(basis_points: u16, seed: &[&[u8]]) -> bool {
+    if basis_points == 0 {
+        return false;
+    }
+    let mut bytes = b"kestrel/network/drop/v1".to_vec();
+    for part in seed {
+        bytes.extend_from_slice(part);
+    }
+    let digest = Hash::digest(bytes);
+    let sample = u16::from_be_bytes([digest.as_bytes()[0], digest.as_bytes()[1]]) % 10_000;
+    sample < basis_points
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ShredRequest {
     shred: Shred,
@@ -389,14 +469,19 @@ struct ShredResponse;
 
 #[cfg(test)]
 mod tests {
-    use std::{net::TcpListener, time::Duration};
+    use std::{
+        net::TcpListener,
+        time::{Duration, Instant},
+    };
 
     use tokio::sync::mpsc;
     use types::Hash;
 
     use crate::Shred;
 
-    use super::{ConfiguredPeer, GossipConfig, GossipError, NetworkHandle, NetworkNode};
+    use super::{
+        ConfiguredPeer, GossipConfig, GossipError, NetworkFaults, NetworkHandle, NetworkNode,
+    };
 
     #[test]
     fn full_shred_queue_does_not_block_transaction_queue() {
@@ -596,6 +681,165 @@ mod tests {
 
         first.task.abort();
         second.task.abort();
+    }
+
+    /// Spawns a receiver and a sender that dials it as a configured peer,
+    /// applying `sender_faults` to the sender, and waits for the connection to
+    /// establish. Returns `(receiver, sender)`.
+    async fn configured_pair(sender_faults: NetworkFaults) -> (NetworkNode, NetworkNode) {
+        let receiver_port = reserve_port();
+        let receiver_identity = libp2p::identity::Keypair::generate_ed25519();
+        let receiver_peer = receiver_identity.public().to_peer_id();
+        let receiver = NetworkNode::spawn(
+            receiver_identity,
+            GossipConfig {
+                listen_address: format!("/ip4/127.0.0.1/tcp/{receiver_port}")
+                    .parse()
+                    .unwrap(),
+                heartbeat_interval: Duration::from_millis(25),
+                ..GossipConfig::default()
+            },
+        )
+        .unwrap();
+        let sender = NetworkNode::spawn(
+            libp2p::identity::Keypair::generate_ed25519(),
+            GossipConfig {
+                listen_address: "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+                configured_peers: vec![ConfiguredPeer {
+                    peer_id: receiver_peer,
+                    address: format!("/ip4/127.0.0.1/tcp/{receiver_port}")
+                        .parse()
+                        .unwrap(),
+                }],
+                heartbeat_interval: Duration::from_millis(25),
+                faults: sender_faults,
+                ..GossipConfig::default()
+            },
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        (receiver, sender)
+    }
+
+    fn sample_shred() -> Shred {
+        Shred {
+            block_id: Hash::digest(b"fault-injection-block"),
+            index: 0,
+            data_shards: 1,
+            parity_shards: 1,
+            original_len: 1,
+            payload: vec![7],
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transaction_drop_basis_points_can_silence_a_nodes_gossip() {
+        // Control: no fault, so the receiver does get the transaction. This
+        // proves the mesh is live, so the silence under fault below is the drop
+        // and not merely an unformed mesh (i.e. the fault assertion is real).
+        let (mut receiver, sender) = configured_pair(NetworkFaults::default()).await;
+        sender
+            .handle
+            .try_publish_transaction(b"gossiped-transaction".to_vec())
+            .unwrap();
+        let delivered =
+            tokio::time::timeout(Duration::from_secs(3), receiver.inbound_transactions.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(delivered.bytes, b"gossiped-transaction");
+        receiver.task.abort();
+        sender.task.abort();
+
+        // Fault: 100% outbound transaction loss. `publish` is never reached, so
+        // nothing enters the sender's gossip cache and nothing is ever delivered.
+        let (mut receiver, sender) = configured_pair(NetworkFaults {
+            transaction_drop_basis_points: 10_000,
+            ..NetworkFaults::default()
+        })
+        .await;
+        sender
+            .handle
+            .try_publish_transaction(b"gossiped-transaction".to_vec())
+            .unwrap();
+        let silenced = tokio::time::timeout(
+            Duration::from_millis(750),
+            receiver.inbound_transactions.recv(),
+        )
+        .await;
+        assert!(
+            silenced.is_err(),
+            "a fully-dropped transaction path must deliver nothing"
+        );
+        receiver.task.abort();
+        sender.task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shred_drop_basis_points_models_a_dead_relay_path() {
+        // Control: a healthy shred path delivers.
+        let (mut receiver, sender) = configured_pair(NetworkFaults::default()).await;
+        sender
+            .handle
+            .try_send_shred(receiver.local_peer_id, sample_shred())
+            .unwrap();
+        let delivered =
+            tokio::time::timeout(Duration::from_secs(3), receiver.inbound_shreds.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(delivered.shred, sample_shred());
+        receiver.task.abort();
+        sender.task.abort();
+
+        // Fault: 100% outbound shred loss models a node whose relay/leader shred
+        // path is dead — it forwards nothing.
+        let (mut receiver, sender) = configured_pair(NetworkFaults {
+            shred_drop_basis_points: 10_000,
+            ..NetworkFaults::default()
+        })
+        .await;
+        sender
+            .handle
+            .try_send_shred(receiver.local_peer_id, sample_shred())
+            .unwrap();
+        let silenced =
+            tokio::time::timeout(Duration::from_millis(750), receiver.inbound_shreds.recv()).await;
+        assert!(
+            silenced.is_err(),
+            "a fully-dropped shred path must deliver nothing"
+        );
+        receiver.task.abort();
+        sender.task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn outbound_delay_postpones_shred_delivery_without_losing_it() {
+        // A 400ms outbound delay must push delivery well past the sub-10ms
+        // loopback baseline the other tests deliver at, while still arriving.
+        let (mut receiver, sender) = configured_pair(NetworkFaults {
+            outbound_delay: Duration::from_millis(400),
+            ..NetworkFaults::default()
+        })
+        .await;
+        let sent_at = Instant::now();
+        sender
+            .handle
+            .try_send_shred(receiver.local_peer_id, sample_shred())
+            .unwrap();
+        let delivered =
+            tokio::time::timeout(Duration::from_secs(3), receiver.inbound_shreds.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        let elapsed = sent_at.elapsed();
+        assert_eq!(delivered.shred, sample_shred());
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "outbound delay of 400ms must postpone delivery (took {elapsed:?})"
+        );
+        receiver.task.abort();
+        sender.task.abort();
     }
 
     fn reserve_port() -> u16 {

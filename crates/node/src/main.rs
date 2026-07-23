@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use libp2p::{Multiaddr, PeerId, identity};
-use network::{ConfiguredPeer, GossipConfig, NetworkNode};
+use network::{ConfiguredPeer, GossipConfig, NetworkFaults, NetworkNode};
 use node::{
     BlockLifecycle, ConsensusCoordinator, CoordinatorConfig, CoordinatorFaults, GenesisDocument,
     Stage2Pipeline, Stage2PipelineConfig,
@@ -124,11 +124,20 @@ async fn main() -> Result<()> {
             NEW_OBJECT_RENT_BALANCE,
             std::thread::available_parallelism().map_or(4, std::num::NonZero::get),
         )?;
+        let network_faults = NetworkFaults {
+            outbound_delay: Duration::from_millis(
+                parse_optional(&arguments, "--gossip-delay-ms")?.unwrap_or(0),
+            ),
+            transaction_drop_basis_points: parse_optional(&arguments, "--tx-drop-bps")?
+                .unwrap_or(0),
+            shred_drop_basis_points: parse_optional(&arguments, "--shred-drop-bps")?.unwrap_or(0),
+        };
         let network_node = NetworkNode::spawn(
             gossip_identity,
             GossipConfig {
                 listen_address,
                 configured_peers,
+                faults: network_faults,
                 ..GossipConfig::default()
             },
         )?;

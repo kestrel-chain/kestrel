@@ -106,17 +106,25 @@ Priority meanings:
   still passes. The raw-TCP `ConsensusCoordinator` proposal/vote/certificate
   transport remains a deliberately separate channel from libp2p (documented, not
   unified — its own `CoordinatorFaults` fault-injection knobs are unaffected by
-  which proposal source feeds it). Still outstanding: this has only run on one
-  machine over loopback for seconds at a time; nobody has injected socket-level
-  latency/loss/relay death specifically on the libp2p transaction/shred paths (as
-  opposed to the raw-TCP consensus messages, which already have this), and nobody
-  has measured propagation-to-80%-stake or end-to-end finality under those
-  conditions or across real network topology/geography.
-- **Expected resolution:** Inject socket-level latency/loss and relay death on
-  the libp2p transaction/shred paths specifically, then run a real Stage 2
-  private devnet (external of this workspace's automated tests) across real
-  machines/geography and record propagation-to-80%-stake and end-to-end finality
-  numbers, per §9 Stage 2's exit criteria.
+  which proposal source feeds it). Socket-level fault injection now exists on
+  the libp2p transaction/shred paths too, closing the tooling gap that
+  previously left only the raw-TCP consensus path exercisable this way:
+  `network::NetworkFaults` (wired through `GossipConfig` and the `node run`
+  flags `--gossip-delay-ms`/`--tx-drop-bps`/`--shred-drop-bps`) adds outbound
+  latency and deterministic, payload-keyed loss to a node's own gossip publishes
+  and shred sends, with 100% shred loss modelling a dead relay. Direct
+  two-node-swarm tests confirm each knob actually degrades delivery and are
+  verified non-vacuous (a control with faults disabled still delivers, and
+  neutralising the fault application makes all three fault tests fail). Still
+  outstanding: this has only run on one machine over loopback for seconds at a
+  time; nobody has run the network under those injected conditions across real
+  machines/geography, and nobody has measured propagation-to-80%-stake or
+  end-to-end finality under them.
+- **Expected resolution:** Run a real Stage 2 private devnet (external of this
+  workspace's automated tests) across real machines/geography, driving it with
+  the libp2p-path and raw-TCP fault injection now available, and record
+  propagation-to-80%-stake and end-to-end finality numbers, per §9 Stage 2's
+  exit criteria.
 
 ### TD-005 — Signed admission is not connected to network/RPC ingress and the mempool
 
@@ -267,8 +275,9 @@ Priority meanings:
 ### TD-014 — Production peer discovery, reputation, and relay tuning are absent
 
 - **Priority:** High for public deployment; narrowed. Configured bootstrap
-  peers and a real ban mechanism now exist; NAT traversal, in-band reputation
-  scoring, operator policy, and telemetry-driven tuning do not.
+  peers and a real, now-durable ban mechanism exist; NAT traversal, in-band
+  reputation scoring, cross-node ban sharing, operator policy, and
+  telemetry-driven tuning do not.
 - **Introduced:** Phase 3 explicit deferral; bootstrap peers closed alongside
   TD-002, banning closed while scoping this item. Exact commit unavailable.
   Sources: `networking-spec.md`, `phase-3-status.md`, `crates/network/src/service.rs`.
@@ -283,16 +292,26 @@ Priority meanings:
   confirmed the test fails without the ban call). `Stage2Pipeline` tracks an
   in-memory offense count per gossip peer and calls `ban_peer` once a peer's
   invalid-message count crosses a configurable threshold (default 8; the
-  pure counting/threshold logic has its own unit test). What remains absent:
-  bans are in-memory only (not persisted, do not survive a restart, and are not
-  shared/gossiped between nodes — a peer banned by one validator is unknown to
-  the rest), there is no NAT traversal (AutoNAT/relay/hole-punching) for
-  non-LAN/non-preconfigured peers, no operator-facing peer policy (allow/deny
-  lists, manual unban), and no telemetry on ban/offense rates or
-  relay-selection/replication tuning driven by observed network conditions.
-- **Expected resolution:** Persist and gossip ban/offense state so a peer
-  banned by one validator does not stay trusted by the rest, add an
-  authenticated public discovery/NAT strategy for non-preconfigured peers,
+  pure counting/threshold logic has its own unit test). Bans are now persisted
+  durably: crossing the offense threshold writes a ban record to the node's
+  shared `RocksDB` store (keyed by peer ID under `pipeline/ban/v1/`, via
+  `persist_ban`), and `Stage2Pipeline::new` re-applies every persisted ban
+  through `NetworkHandle::ban_peer` on startup (`persisted_bans`, which also
+  prunes any record that does not decode to a valid peer ID), so a peer banned
+  for repeated invalid gossip stays banned across a restart rather than getting
+  a clean slate. A unit test persists bans, reopens the store (standing in for
+  a restart), and confirms they survive and that a corrupt record is tolerated
+  and pruned — verified to fail when persistence is disabled. What remains
+  absent: bans are still per-node (not shared/gossiped between validators — a
+  peer banned by one is unknown to the rest), the in-memory offense *count*
+  below the ban threshold still resets on restart, there is no NAT traversal
+  (AutoNAT/relay/hole-punching) for non-LAN/non-preconfigured peers, no
+  operator-facing peer policy (allow/deny lists, manual unban), and no telemetry
+  on ban/offense rates or relay-selection/replication tuning driven by observed
+  network conditions.
+- **Expected resolution:** Gossip ban/offense state so a peer banned by one
+  validator does not stay trusted by the rest, add an authenticated public
+  discovery/NAT strategy for non-preconfigured peers,
   expose operator controls (manual ban/unban, policy configuration), add
   telemetry for offense/ban events, and drive relay-selection/replication
   tuning from observed network conditions.
@@ -466,6 +485,32 @@ historical snapshots, but they are not open debt in their original form:
   unauthenticated "attacker" peer, confirms the attack is caught (reproducing
   the original crash when the fix is reverted), and confirms a legitimate
   transaction still commits identically on every node afterward.
+- TD-026 (found and closed in the same pass, while throughput-testing the real
+  `node` binary with many concurrent independent senders): the consensus
+  coordinator's own notion of "current height" advances the instant a
+  certificate forms, on its own task, independently of when the
+  `Stage2Pipeline` task gets around to draining the matching `FinalizedOrder`
+  off its channel and retiring that height's transactions from local
+  mempool/nonce bookkeeping. A validator that never led an earlier height (so
+  its own `select_block` never popped that height's transactions out of its
+  mempool) could be asked to lead a later height before the earlier one was
+  retired locally, and re-select an already-certified transaction — which
+  every honest validator then deterministically rejected as a nonce reuse on
+  the trusted finalized-order path, fatally tearing down both the pipeline and
+  consensus coordinator tasks on every validator simultaneously. Reproduced
+  reliably with 30-100 real, independent, concurrently-submitted transactions
+  across a real 4-process (and separately, 4 in-process) validator set. Fixed
+  in two parts: (1) transactions are now retired from local admission
+  bookkeeping as soon as their block is submitted to the executor, not once it
+  durably commits, closing the original submit-vs-commit race; (2)
+  `PipelineState` tracks a `retired_height`, and building a new proposal more
+  than one height ahead of it is refused (the coordinator leaves the height
+  open and retries), closing the deeper race between the coordinator's
+  certificate-driven height advancement and the pipeline's own message-queue
+  draining. A regression test submits 30 independent transactions through a
+  real in-process 4-validator pipeline and asserts every validator's task
+  survives and every transaction commits everywhere, verified to fail
+  (reproducing the exact crash) when the `retired_height` gate is reverted.
 - TD-021 was closed by deliberately narrowing scope rather than shipping
   unverifiable code: `cli::write_secret` continues to fail closed on
   non-Unix hosts, now with an explicit message directing operators to run

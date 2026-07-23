@@ -36,6 +36,13 @@ use types::{Address, Hash, Object, Owner, Transaction};
 
 const VALIDATOR_COUNT: usize = 4;
 
+struct Sender {
+    key: [u8; 32],
+    public_key: Vec<u8>,
+    address: Address,
+    object: Object,
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[allow(clippy::too_many_lines)] // Keep the full multi-node wiring/assertion timeline auditable.
 async fn stage2_pipeline_commits_a_gossiped_transaction_across_all_nodes() {
@@ -237,6 +244,244 @@ async fn stage2_pipeline_commits_a_gossiped_transaction_across_all_nodes() {
         .map(|status| status.read().unwrap().finalized_height)
         .collect::<Vec<_>>();
     assert!(heights.iter().all(|height| *height >= 1));
+
+    for task in tasks {
+        task.abort();
+    }
+}
+
+/// Reproduces a real crash found by throughput-testing this pipeline with
+/// many concurrent, independent senders: the consensus coordinator's own
+/// notion of "current height" advances the instant a certificate forms, on
+/// its own task, independently of when the pipeline task gets around to
+/// draining the matching `FinalizedOrder` off its channel and retiring that
+/// height's transactions from local mempool/nonce bookkeeping. A validator
+/// that never led an earlier height (so its own `select_block` never popped
+/// that height's transactions out) could race ahead, get asked to lead a
+/// later height before the earlier one was retired, and re-select an
+/// already-certified transaction — which every honest validator then
+/// deterministically rejects as a nonce reuse on the trusted finalized-order
+/// path, fatally tearing down both the pipeline and consensus coordinator
+/// tasks. Fixed by tracking a `retired_height` in `PipelineState` and
+/// refusing to build a proposal more than one height ahead of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[allow(clippy::too_many_lines)] // Keep the full multi-node wiring/assertion timeline auditable.
+async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
+    const TRANSACTION_COUNT: usize = 30;
+    let directory = TempDir::new().unwrap();
+
+    let senders = (0..TRANSACTION_COUNT)
+        .map(|index| {
+            let key = *Hash::digest(index.to_le_bytes()).as_bytes();
+            let public_key = Ed25519Scheme.public_key(&key).unwrap();
+            let address = Ed25519Scheme.address(&public_key).unwrap();
+            let object = Object {
+                id: Hash::digest(format!("concurrent-object-{index}").as_bytes()),
+                owner: Owner::Single(address),
+                type_tag: "stage2::ConcurrentObject".to_owned(),
+                version: 0,
+                data: vec![0],
+                rent_balance: 1_000,
+            };
+            Sender {
+                key,
+                public_key,
+                address,
+                object,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let bls = Bls12381Scheme;
+    let mut bls_keys = Vec::new();
+    let mut libp2p_identities = Vec::new();
+    let mut validators = Vec::new();
+    let gossip_ports = (0..VALIDATOR_COUNT)
+        .map(|_| reserve_port())
+        .collect::<Vec<_>>();
+    for index in 1..=VALIDATOR_COUNT {
+        let key = vec![u8::try_from(index).unwrap(); 32];
+        let public_key = bls.public_key(&key).unwrap();
+        bls_keys.push(key.clone());
+        let gossip_identity = identity::Keypair::generate_ed25519();
+        let gossip_peer_id = gossip_identity.public().to_peer_id().to_string();
+        libp2p_identities.push(gossip_identity);
+        validators.push(GenesisValidator {
+            name: format!("validator-{index}"),
+            validator: Validator {
+                id: Hash::digest([u8::try_from(index).unwrap()]),
+                stake: 20,
+                public_key,
+                proof_of_possession: bls.proof_of_possession(&key).unwrap(),
+            },
+            network_address: reserve_socket_address(),
+            rpc_address: reserve_socket_address(),
+            gossip_peer_id,
+            gossip_address: format!("/ip4/127.0.0.1/tcp/{}", gossip_ports[index - 1]),
+        });
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let genesis = GenesisDocument {
+        format_version: GENESIS_FORMAT_VERSION,
+        chain_id: "kestrel-stage2-concurrent-test".to_owned(),
+        genesis_unix_ms: u64::try_from(now).unwrap() + 1_500,
+        blocks_per_epoch: 100,
+        state_config: StateConfig::default(),
+        active_signature_schemes: vec![1, 2],
+        equivocation_slash_basis_points: 5_000,
+        validators: validators.clone(),
+        initial_objects: senders.iter().map(|sender| sender.object.clone()).collect(),
+        initial_fee_balances: BTreeMap::new(),
+    };
+    let validated = genesis.validate().unwrap();
+
+    let peer_ids = libp2p_identities
+        .iter()
+        .map(identity::Keypair::public)
+        .map(|key| key.to_peer_id())
+        .collect::<Vec<_>>();
+    let validator_peers: BTreeMap<Hash, PeerId> = validators
+        .iter()
+        .zip(peer_ids.iter())
+        .map(|(entry, peer_id)| (entry.validator.id, *peer_id))
+        .collect();
+
+    let mut handles = Vec::new();
+    let mut object_states = Vec::new();
+    let mut tasks = Vec::new();
+
+    for index in 0..VALIDATOR_COUNT {
+        let status = Arc::new(RwLock::new(NodeStatus {
+            chain_id: genesis.chain_id.clone(),
+            genesis_hash: validated.genesis_hash,
+            finalized_height: 0,
+            finalized_block: validated.genesis_hash,
+            state_root: validated.state_root,
+            peer_count: 0,
+            ready: false,
+            finality_latency_ms: None,
+            view_changes: 0,
+        }));
+        let shared_state = Arc::new(RwLock::new(StateTree::new(StateConfig::default()).unwrap()));
+
+        let lifecycle = BlockLifecycle::open(
+            &genesis,
+            directory.path().join(format!("app-{index}")),
+            Arc::clone(&status),
+            Arc::clone(&shared_state),
+            100,
+            4,
+        )
+        .unwrap();
+
+        let configured_peers = (0..VALIDATOR_COUNT)
+            .filter(|other| *other != index)
+            .map(|other| ConfiguredPeer {
+                peer_id: peer_ids[other],
+                address: format!("/ip4/127.0.0.1/tcp/{}", gossip_ports[other])
+                    .parse::<Multiaddr>()
+                    .unwrap(),
+            })
+            .collect();
+        let network_node = NetworkNode::spawn(
+            libp2p_identities[index].clone(),
+            GossipConfig {
+                listen_address: format!("/ip4/127.0.0.1/tcp/{}", gossip_ports[index])
+                    .parse()
+                    .unwrap(),
+                configured_peers,
+                heartbeat_interval: Duration::from_millis(25),
+                ..GossipConfig::default()
+            },
+        )
+        .unwrap();
+
+        let (finalized_order_sender, finalized_order_receiver) = mpsc::unbounded_channel();
+        let (pipeline, handle) = Stage2Pipeline::new(
+            &genesis,
+            network_node,
+            lifecycle,
+            validator_peers.clone(),
+            finalized_order_receiver,
+            Stage2PipelineConfig::default(),
+        )
+        .unwrap();
+        let proposal_source = pipeline.proposal_source();
+
+        let coordinator = ConsensusCoordinator::bind_with_pipeline(
+            &genesis,
+            validators[index].validator.id,
+            bls_keys[index].clone(),
+            directory.path().join(format!("consensus-{index}")),
+            Arc::clone(&status),
+            CoordinatorConfig::default(),
+            CoordinatorFaults::default(),
+            proposal_source,
+            finalized_order_sender,
+        )
+        .await
+        .unwrap();
+
+        let genesis_time = genesis.genesis_unix_ms;
+        tasks.push(tokio::spawn(async move {
+            let _ = coordinator.run(genesis_time).await;
+        }));
+        tasks.push(tokio::spawn(async move {
+            let _ = pipeline.run().await;
+        }));
+
+        handles.push(handle);
+        object_states.push(shared_state);
+    }
+
+    // Let the gossip mesh dial and stabilize before genesis time arrives.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    for (index, sender) in senders.iter().enumerate() {
+        let transaction = signed_mutation(
+            &sender.key,
+            &sender.public_key,
+            sender.address,
+            0,
+            &sender.object,
+            0,
+            1,
+        );
+        handles[index % handles.len()]
+            .submit_transaction(transaction)
+            .unwrap();
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    loop {
+        let all_committed = object_states.iter().all(|state| {
+            let state = state.read().unwrap();
+            senders.iter().all(|sender| {
+                state
+                    .object(&sender.object.id)
+                    .is_some_and(|o| o.data == vec![1])
+            })
+        });
+        if all_committed {
+            break;
+        }
+        assert!(
+            tasks.iter().all(|task| !task.is_finished()),
+            "a validator's pipeline or coordinator task crashed under concurrent independent-sender load"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "not all independent transactions committed on every node in time"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        tasks.iter().all(|task| !task.is_finished()),
+        "a validator's pipeline or coordinator task crashed under concurrent independent-sender load"
+    );
 
     for task in tasks {
         task.abort();

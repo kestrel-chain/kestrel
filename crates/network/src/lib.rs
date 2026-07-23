@@ -7,6 +7,6 @@ pub use kestrel_cast::{
     KestrelCast, KestrelCastConfig, KestrelCastError, RelayCandidate, RelayPlan, Shred,
 };
 pub use service::{
-    ConfiguredPeer, GossipConfig, GossipError, InboundShred, InboundTransaction, NetworkHandle,
-    NetworkNode,
+    ConfiguredPeer, GossipConfig, GossipError, InboundShred, InboundTransaction, NetworkFaults,
+    NetworkHandle, NetworkNode,
 };

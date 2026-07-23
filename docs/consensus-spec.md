@@ -33,7 +33,7 @@ Validator votes use BLS12-381 in the minimum-public-key configuration. Validator
 
 Finality emits an ordered block ID and transaction hashes. `DeferredExecutor` owns state in a separate worker stage and accepts the corresponding executable payloads through a one-block bounded channel. Ordering can finalize the next height without polling or waiting for the previous execution result. Execution remains canonical Phase 2 parallel execution; state roots do not feed back into the ordering vote.
 
-The one-block bound is backpressure, not a consensus dependency. A node coordinator must stop admitting additional ordered payloads if execution falls more than one buffered block behind.
+The one-block bound is backpressure, not a consensus dependency. A node coordinator must stop admitting additional ordered payloads if execution falls more than one buffered block behind. After finalizing a height, the production coordinator gives transaction gossip one bounded 15ms propagation margin before asking the next leader to snapshot an otherwise-empty mempool; already-queued work bypasses the margin.
 
 ## Phase 6 slashing evidence
 

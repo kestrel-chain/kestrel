@@ -27,6 +27,9 @@ use crate::{GenesisDocument, GenesisError};
 
 const SAFETY_STATE_KEY: &[u8] = b"consensus/replica-snapshot/v1";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+/// Gives transaction gossip one measured propagation window to reach the next
+/// leader before it snapshots an otherwise-empty mempool into a proposal.
+const EMPTY_MEMPOOL_PROPAGATION_MARGIN: Duration = Duration::from_millis(15);
 
 /// Static real-socket consensus timings and termination bound.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,6 +100,13 @@ enum WireMessage {
 /// propagated payload — see `BlockLifecycle::submit_payload`.
 pub trait ProposalTransactionSource: Send + Sync {
     fn transaction_ids(&self, height: u64, parent_id: Hash) -> Option<(Vec<Hash>, Hash)>;
+
+    /// Reports whether asking for a proposal now would snapshot an empty
+    /// transaction set. Sources that cannot answer cheaply should retain the
+    /// default and will not be delayed.
+    fn is_empty(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -359,6 +369,12 @@ impl ConsensusCoordinator {
                 || round.last_proposal_broadcast.elapsed() >= self.config.proposal_rebroadcast)
         {
             if round.proposal.is_none() {
+                if round.should_defer_empty_proposal(
+                    EMPTY_MEMPOOL_PROPAGATION_MARGIN,
+                    self.proposal_source.is_empty(),
+                ) {
+                    return Ok(None);
+                }
                 let Some((transaction_ids, fee_commitment)) = self
                     .proposal_source
                     .transaction_ids(height, self.replica.parent_id())
@@ -827,6 +843,7 @@ impl ConsensusCoordinator {
 struct RoundState {
     started: Instant,
     height_started: Instant,
+    follows_commit: bool,
     last_proposal_broadcast: Instant,
     proposal: Option<SignedProposal>,
     observed_proposals: BTreeMap<Hash, SignedProposal>,
@@ -861,6 +878,7 @@ impl RoundState {
         Self {
             started: now,
             height_started: now,
+            follows_commit: false,
             last_proposal_broadcast: now,
             proposal: None,
             observed_proposals: BTreeMap::new(),
@@ -874,11 +892,18 @@ impl RoundState {
     }
 
     fn new_height() -> Self {
-        Self::new()
+        Self {
+            follows_commit: true,
+            ..Self::new()
+        }
     }
 
     fn proposal_delay_elapsed(&self, delay: Duration) -> bool {
         self.started.elapsed() >= delay
+    }
+
+    fn should_defer_empty_proposal(&self, margin: Duration, source_is_empty: bool) -> bool {
+        self.follows_commit && source_is_empty && self.height_started.elapsed() < margin
     }
 
     fn has(&self, flag: RoundFlag) -> bool {
@@ -993,7 +1018,7 @@ mod tests {
         collections::BTreeMap,
         net::TcpListener as StdTcpListener,
         sync::{Arc, RwLock},
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use consensus::Validator;
@@ -1017,6 +1042,21 @@ mod tests {
             bytes.extend_from_slice(parent_id.as_bytes());
             Some((vec![Hash::digest(bytes)], Hash::default()))
         }
+    }
+
+    #[test]
+    fn only_an_empty_post_commit_height_waits_for_the_propagation_margin() {
+        let margin = Duration::from_millis(15);
+
+        let initial_height = super::RoundState::new();
+        assert!(!initial_height.should_defer_empty_proposal(margin, true));
+
+        let mut post_commit = super::RoundState::new_height();
+        assert!(post_commit.should_defer_empty_proposal(margin, true));
+        assert!(!post_commit.should_defer_empty_proposal(margin, false));
+
+        post_commit.height_started = Instant::now().checked_sub(margin).unwrap();
+        assert!(!post_commit.should_defer_empty_proposal(margin, true));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

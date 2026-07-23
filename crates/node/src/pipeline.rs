@@ -18,8 +18,8 @@ use tracing::{debug, warn};
 use types::{Address, Hash, Transaction};
 
 use crate::{
-    BlockLifecycle, DurableBlockRecord, GenesisDocument, LifecycleError, PropagatedBlock,
-    ProposalTransactionSource, TransactionValidator,
+    BlockLifecycle, GenesisDocument, LifecycleError, PropagatedBlock, ProposalTransactionSource,
+    TransactionValidator,
 };
 
 /// Bounded production composition settings for the Stage 2 socket pipeline.
@@ -35,8 +35,9 @@ pub struct Stage2PipelineConfig {
     pub maximum_inflight_shred_blocks: usize,
     pub commit_poll_interval: Duration,
     /// Invalid gossiped transactions/shreds attributed to the same peer before
-    /// it is disconnected and blocked. Bans are in-memory only (not persisted
-    /// or shared across nodes) and never automatically expire.
+    /// it is disconnected and blocked. Bans are persisted durably to the node's
+    /// store and re-applied on restart (TD-014), but are not shared across
+    /// nodes and never automatically expire.
     pub peer_offense_ban_threshold: u32,
 }
 
@@ -105,12 +106,14 @@ pub struct Stage2Pipeline {
     peer_ids: BTreeSet<PeerId>,
     local_peer_id: PeerId,
     pending_orders: BTreeMap<u64, FinalizedOrder>,
-    submitted_payloads: BTreeMap<u64, PropagatedBlock>,
     submitted_height: u64,
     config: Stage2PipelineConfig,
     /// In-memory offense count per gossip peer that has sent an invalid
-    /// transaction or shred, used to ban repeat offenders.
+    /// transaction or shred, used to ban repeat offenders. Resets on restart;
+    /// the resulting bans do not (they are persisted via `store`).
     offense_counts: BTreeMap<PeerId, u32>,
+    /// Shared node store used to persist peer bans so they survive a restart.
+    store: Arc<RocksDbStore>,
 }
 
 impl Stage2Pipeline {
@@ -175,6 +178,7 @@ impl Stage2Pipeline {
                 payloads: BTreeMap::new(),
                 shreds: BTreeMap::new(),
                 propagated: BTreeSet::new(),
+                retired_height: lifecycle.committed_height(),
             }),
             validator: TransactionValidator::from_genesis(genesis)?,
             network: network_node.handle.clone(),
@@ -196,6 +200,14 @@ impl Stage2Pipeline {
                 admission_store.delete(&key)?;
             }
         }
+        // Re-apply any peer bans persisted before a restart, so a peer banned
+        // for repeated invalid gossip stays banned across a crash rather than
+        // getting a clean slate (TD-014). Malformed entries are pruned.
+        for peer in persisted_bans(&admission_store)? {
+            if let Err(error) = network_node.handle.ban_peer(peer) {
+                debug!(%peer, %error, "failed to re-apply a persisted ban on restart");
+            }
+        }
         let handle = Stage2PipelineHandle {
             source: Arc::clone(&source),
             network: network_node.handle.clone(),
@@ -214,10 +226,10 @@ impl Stage2Pipeline {
                 peer_ids,
                 local_peer_id: network_node.local_peer_id,
                 pending_orders: BTreeMap::new(),
-                submitted_payloads: BTreeMap::new(),
                 submitted_height,
                 config,
                 offense_counts: BTreeMap::new(),
+                store: admission_store,
             },
             handle,
         ))
@@ -268,9 +280,7 @@ impl Stage2Pipeline {
                 }
                 _ = ticker.tick() => {
                     self.submit_available_orders()?;
-                    if let Some(record) = self.lifecycle.poll_commit()? {
-                        self.on_commit(&record)?;
-                    }
+                    self.lifecycle.poll_commit()?;
                 }
                 else => return Err(PipelineError::PipelineClosed),
             }
@@ -278,11 +288,15 @@ impl Stage2Pipeline {
     }
 
     /// Records one invalid message from `peer`, banning it once its offense
-    /// count reaches `peer_offense_ban_threshold`. Bans live only in this
-    /// process's memory: they are not persisted and never automatically lift.
+    /// count reaches `peer_offense_ban_threshold`. The ban is persisted before
+    /// it is applied so it survives a restart (TD-014); it is not shared with
+    /// other nodes and never automatically lifts.
     fn record_offense(&mut self, peer: PeerId) {
         let offenses = tally_offense(&mut self.offense_counts, peer);
         if offenses == self.config.peer_offense_ban_threshold {
+            if let Err(error) = persist_ban(&self.store, peer) {
+                debug!(%peer, %error, "failed to persist peer ban");
+            }
             match self.network.ban_peer(peer) {
                 Ok(()) => warn!(%peer, offenses, "banned peer after repeated invalid gossip"),
                 Err(error) => debug!(%peer, %error, "failed to queue peer ban"),
@@ -326,18 +340,23 @@ impl Stage2Pipeline {
             };
             self.lifecycle.submit_payload(order, &payload)?;
             self.pending_orders.remove(&height);
-            self.submitted_payloads.insert(height, payload);
+            // A certified, submitted order is canonical for this height —
+            // durable execution/commit still has to happen, but no other
+            // block will ever contend for these transactions again. Retiring
+            // them from the local mempool/reservation bookkeeping here,
+            // rather than waiting for `poll_commit` to observe the durable
+            // commit, closes a window where a validator that was not this
+            // height's leader (so its own mempool never popped these
+            // transactions out via `select_block`) could still have them
+            // sitting in queue and re-select them into a later height it
+            // does lead — a real, reproduced bug: the later block would
+            // duplicate an already-submitted transaction and every honest
+            // validator would independently reject it as a nonce reuse,
+            // fatally tearing down the pipeline task on the trusted
+            // finalized-order path.
+            self.source.note_submitted(&payload)?;
             self.submitted_height = height;
         }
-    }
-
-    fn on_commit(&mut self, record: &DurableBlockRecord) -> Result<(), PipelineError> {
-        let payload = self
-            .submitted_payloads
-            .remove(&record.height)
-            .ok_or(PipelineError::CommittedPayloadUnavailable)?;
-        self.source.note_committed(&payload)?;
-        Ok(())
     }
 }
 
@@ -356,6 +375,17 @@ struct PipelineState {
     payloads: BTreeMap<(u64, Hash), PropagatedBlock>,
     shreds: BTreeMap<Hash, BTreeMap<u16, Shred>>,
     propagated: BTreeSet<(u64, Hash)>,
+    /// The last height this validator's own mempool has retired transactions
+    /// for (see `note_submitted`). A new proposal may not be built for any
+    /// height beyond this plus one: the consensus coordinator's own notion of
+    /// "current height" advances the instant a certificate forms, on its own
+    /// task, independently of when the pipeline task gets around to draining
+    /// the `FinalizedOrder` for that height off its channel and retiring its
+    /// transactions here. Without this gate, a validator that never led an
+    /// earlier height (so its own `select_block` never popped that height's
+    /// transactions out) could race ahead and re-select an already-certified
+    /// transaction into a later height it does lead.
+    retired_height: u64,
 }
 
 struct PipelineProposalSource {
@@ -373,11 +403,37 @@ struct PipelineProposalSource {
 }
 
 const ADMISSION_KEY_PREFIX: &[u8] = b"pipeline/admission/pending/";
+const BAN_KEY_PREFIX: &[u8] = b"pipeline/ban/v1/";
 
 fn admission_key(id: Hash) -> Vec<u8> {
     let mut key = ADMISSION_KEY_PREFIX.to_vec();
     key.extend_from_slice(id.as_bytes());
     key
+}
+
+fn ban_key(peer: PeerId) -> Vec<u8> {
+    let mut key = BAN_KEY_PREFIX.to_vec();
+    key.extend_from_slice(&peer.to_bytes());
+    key
+}
+
+/// Durably records that `peer` is banned. The value is empty; the key's
+/// presence is the ban.
+fn persist_ban(store: &RocksDbStore, peer: PeerId) -> Result<(), StorageError> {
+    store.put(&ban_key(peer), &[])
+}
+
+/// Reads back every persisted ban, pruning any entry whose key does not decode
+/// to a valid `PeerId` (so a corrupt record can never wedge startup).
+fn persisted_bans(store: &RocksDbStore) -> Result<Vec<PeerId>, PipelineError> {
+    let mut peers = Vec::new();
+    for (key, _value) in store.iterate_prefix(BAN_KEY_PREFIX)? {
+        match PeerId::from_bytes(&key[BAN_KEY_PREFIX.len()..]) {
+            Ok(peer) => peers.push(peer),
+            Err(_) => store.delete(&key)?,
+        }
+    }
+    Ok(peers)
 }
 
 impl PipelineProposalSource {
@@ -434,8 +490,10 @@ impl PipelineProposalSource {
             self.admission_store.delete(&admission_key(id))?;
             return Err(error.into());
         }
-        state.reserved_senders.insert(transaction.sender, id);
+        let sender = transaction.sender;
+        state.reserved_senders.insert(sender, id);
         state.transactions.insert(id, transaction);
+        debug!(transaction_id = %id, %sender, "admitted transaction");
         Ok(id)
     }
 
@@ -460,6 +518,20 @@ impl PipelineProposalSource {
         let mut state = self.state.lock().map_err(|_| PipelineError::LockPoisoned)?;
         if let Some(payload) = state.payloads.get(&key) {
             return Ok(payload.clone());
+        }
+        // The consensus coordinator's own height advances the instant a
+        // certificate forms, on a separate task from this one — it can ask
+        // for height N+1 before this validator's mempool has retired height
+        // N's transactions (`note_submitted` runs only once the
+        // `FinalizedOrder` for N works its way through the pipeline task's
+        // channel). Selecting now would risk re-including a transaction
+        // that is already canonical at an earlier height. Report not-ready
+        // instead; the coordinator leaves the height open and retries.
+        if height > state.retired_height.saturating_add(1) {
+            return Err(PipelineError::PreviousHeightNotRetired {
+                height,
+                retired_height: state.retired_height,
+            });
         }
         let selection = state
             .mempool
@@ -486,6 +558,12 @@ impl PipelineProposalSource {
             transactions,
             base_fees,
         };
+        debug!(
+            height,
+            transaction_count = payload.transactions.len(),
+            scope_visits = selection.scope_visits,
+            "built new block proposal"
+        );
         state.payloads.insert(key, payload.clone());
         Ok(payload)
     }
@@ -576,7 +654,15 @@ impl PipelineProposalSource {
         Ok(None)
     }
 
-    fn note_committed(&self, payload: &PropagatedBlock) -> Result<(), PipelineError> {
+    /// Retires a certified, submitted order's transactions from local
+    /// admission bookkeeping (mempool queues, sender reservations, nonce
+    /// tracking, the durable admission log). Called once a block is
+    /// submitted, not once it durably commits: a follower that never led
+    /// this height never popped these transactions out of its own mempool
+    /// via `select_block`, so leaving them queued until commit would let it
+    /// re-select an already-canonical transaction into a later height it
+    /// does lead.
+    fn note_submitted(&self, payload: &PropagatedBlock) -> Result<(), PipelineError> {
         let ids = payload
             .transaction_ids()?
             .into_iter()
@@ -605,6 +691,7 @@ impl PipelineProposalSource {
         state
             .propagated
             .retain(|(height, _)| *height > payload.height);
+        state.retired_height = state.retired_height.max(payload.height);
         Ok(())
     }
 }
@@ -615,6 +702,12 @@ impl ProposalTransactionSource for PipelineProposalSource {
         self.propagate(height, parent_id, &payload).ok()?;
         let transaction_ids = payload.transaction_ids().ok()?;
         Some((transaction_ids, payload.fee_commitment()))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| state.transactions.is_empty())
     }
 }
 
@@ -633,8 +726,10 @@ pub enum PipelineError {
     NonceOverflow,
     #[error("the mempool selected a transaction whose signed envelope is unavailable")]
     SelectedTransactionUnavailable,
-    #[error("the committed block's submitted payload is unavailable")]
-    CommittedPayloadUnavailable,
+    #[error(
+        "cannot propose height {height}: this validator has only retired transactions through height {retired_height}"
+    )]
+    PreviousHeightNotRetired { height: u64, retired_height: u64 },
     #[error("the in-flight shred-block limit was reached")]
     InflightShredLimitReached,
     #[error("all Stage 2 pipeline inputs closed")]
@@ -664,7 +759,45 @@ fn tally_offense(offense_counts: &mut BTreeMap<PeerId, u32>, peer: PeerId) -> u3
 
 #[cfg(test)]
 mod tests {
-    use super::tally_offense;
+    use std::collections::BTreeSet;
+
+    use libp2p::PeerId;
+    use storage::{KvStore, RocksDbStore};
+    use tempfile::TempDir;
+
+    use super::{BAN_KEY_PREFIX, persist_ban, persisted_bans, tally_offense};
+
+    #[test]
+    fn persisted_bans_survive_a_store_reopen_and_tolerate_corrupt_entries() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("store");
+        let banned = PeerId::random();
+        let also_banned = PeerId::random();
+
+        // First "process": persist two bans, plus a corrupt ban record whose
+        // key does not decode to a PeerId.
+        {
+            let store = RocksDbStore::open(&path).unwrap();
+            persist_ban(&store, banned).unwrap();
+            persist_ban(&store, also_banned).unwrap();
+            let mut corrupt = BAN_KEY_PREFIX.to_vec();
+            corrupt.extend_from_slice(b"not-a-peer-id");
+            store.put(&corrupt, &[]).unwrap();
+        }
+
+        // Second "process": reopen at the same path (a restart). Both real bans
+        // must come back; the corrupt entry is skipped and pruned.
+        let store = RocksDbStore::open(&path).unwrap();
+        let restored = persisted_bans(&store).unwrap();
+        assert_eq!(
+            restored.iter().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([banned, also_banned]),
+            "every persisted ban must be re-read after a restart"
+        );
+        // The corrupt record was deleted on read, so a second pass returns only
+        // the two valid bans and leaves nothing malformed behind.
+        assert_eq!(persisted_bans(&store).unwrap().len(), 2);
+    }
 
     #[test]
     fn tally_offense_crosses_the_ban_threshold_exactly_once() {

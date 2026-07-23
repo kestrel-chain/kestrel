@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use state::{StateError, StateSnapshot, StateTree};
 use storage::{KvStore, RocksDbStore, StorageError, WriteBatch};
 use thiserror::Error;
-use tracing::warn;
+use tracing::{debug, warn};
 use types::{Address, Hash, Transaction};
 
 use crate::{GenesisDocument, GenesisError};
@@ -610,6 +610,11 @@ impl BlockLifecycle {
         self.committed_block = record.consensus_block_id;
         self.pending.remove(&record.height);
         self.completed = None;
+        debug!(
+            height = record.height,
+            transaction_count = record.transaction_ids.len(),
+            "committed block"
+        );
         Ok(Some(record))
     }
 
