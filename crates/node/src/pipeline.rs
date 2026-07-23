@@ -11,6 +11,7 @@ use network::{
     GossipError, InboundShred, KestrelCast, KestrelCastConfig, KestrelCastError, NetworkHandle,
     NetworkNode, RelayCandidate, Shred,
 };
+use storage::{KvStore, RocksDbStore, StorageError};
 use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinHandle, time::MissedTickBehavior};
 use tracing::{debug, warn};
@@ -163,6 +164,7 @@ impl Stage2Pipeline {
                 })
             })
             .collect();
+        let admission_store = lifecycle.store_handle();
         let source = Arc::new(PipelineProposalSource {
             state: Mutex::new(PipelineState {
                 mempool,
@@ -179,7 +181,21 @@ impl Stage2Pipeline {
             validator_peers,
             candidates,
             config,
+            admission_store: Arc::clone(&admission_store),
         });
+        // Restore any transaction admitted before a restart but not yet
+        // finalized. `admit` re-validates against the freshly restored
+        // nonces above, so an entry already finalized before the crash is
+        // naturally rejected as stale here rather than silently reinstated.
+        for (key, value) in admission_store.iterate_prefix(ADMISSION_KEY_PREFIX)? {
+            let restore = bcs::from_bytes::<Transaction>(&value)
+                .map_err(|error| PipelineError::Encoding(error.to_string()))
+                .and_then(|transaction| source.admit(transaction));
+            if let Err(error) = restore {
+                debug!(%error, "dropping stale persisted admission on restart");
+                admission_store.delete(&key)?;
+            }
+        }
         let handle = Stage2PipelineHandle {
             source: Arc::clone(&source),
             network: network_node.handle.clone(),
@@ -349,6 +365,19 @@ struct PipelineProposalSource {
     validator_peers: BTreeMap<Hash, PeerId>,
     candidates: Vec<RelayCandidate>,
     config: Stage2PipelineConfig,
+    /// Durable log of admitted-but-not-yet-finalized transactions, so a
+    /// restart does not silently drop one (the sender would otherwise have
+    /// to notice and resubmit). Shares the node's single `RocksDB` store
+    /// (see `BlockLifecycle::store_handle`) rather than opening a second one.
+    admission_store: Arc<RocksDbStore>,
+}
+
+const ADMISSION_KEY_PREFIX: &[u8] = b"pipeline/admission/pending/";
+
+fn admission_key(id: Hash) -> Vec<u8> {
+    let mut key = ADMISSION_KEY_PREFIX.to_vec();
+    key.extend_from_slice(id.as_bytes());
+    key
 }
 
 impl PipelineProposalSource {
@@ -384,8 +413,13 @@ impl PipelineProposalSource {
             .copied()
             .map_or(FeeScope::Account(transaction.sender), FeeScope::Object);
         let arrival_sequence = state.arrival_sequence;
+        // Persist before any in-memory mutation: if this fails, admission
+        // aborts cleanly with no partial mempool/reservation state to unwind.
+        let encoded = bcs::to_bytes(&transaction)
+            .map_err(|error| PipelineError::Encoding(error.to_string()))?;
+        self.admission_store.put(&admission_key(id), &encoded)?;
         state.arrival_sequence = state.arrival_sequence.saturating_add(1);
-        state.mempool.submit(SubmittedTransaction {
+        if let Err(error) = state.mempool.submit(SubmittedTransaction {
             id,
             sender: transaction.sender,
             scope,
@@ -395,7 +429,11 @@ impl PipelineProposalSource {
             priority_fee_per_compute: payload.priority_fee_per_compute,
             arrival_sequence,
             policy_data: payload.policy_data,
-        })?;
+        }) {
+            // Nothing durable should outlive a rejected admission.
+            self.admission_store.delete(&admission_key(id))?;
+            return Err(error.into());
+        }
         state.reserved_senders.insert(transaction.sender, id);
         state.transactions.insert(id, transaction);
         Ok(id)
@@ -409,6 +447,7 @@ impl PipelineProposalSource {
         if let Some(transaction) = state.transactions.remove(&id) {
             state.reserved_senders.remove(&transaction.sender);
         }
+        self.admission_store.delete(&admission_key(id))?;
         Ok(())
     }
 
@@ -552,6 +591,7 @@ impl PipelineProposalSource {
         state.mempool.remove_transactions(&ids);
         for id in ids {
             state.transactions.remove(&id);
+            self.admission_store.delete(&admission_key(id))?;
         }
         state
             .payloads
@@ -604,6 +644,8 @@ pub enum PipelineError {
     Gossip(#[from] GossipError),
     #[error(transparent)]
     KestrelCast(#[from] KestrelCastError),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
 }
 
 /// Increments `peer`'s offense count and returns the new total.

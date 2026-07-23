@@ -27,6 +27,7 @@ use crate::{GenesisDocument, GenesisError};
 
 const CHECKPOINT_KEY: &[u8] = b"application/checkpoint/v1";
 const BLOCK_PREFIX: &[u8] = b"application/block/v1/";
+const PENDING_PREFIX: &[u8] = b"application/pending/v1/";
 const TRANSACTION_ID_DOMAIN: &[u8] = b"kestrel/transaction/id/v1";
 const CHECKPOINT_FORMAT_VERSION: u16 = 1;
 const SIGNED_EXECUTION_MAGIC: [u8; 8] = *b"KSTRTX01";
@@ -194,11 +195,17 @@ struct DurableCheckpoint {
     state: StateSnapshot,
 }
 
+/// A finalized order already handed to the deferred executor but not yet
+/// committed. Persisted durably so a crash between submission and commit
+/// does not strand the node waiting for the network to resend a block it
+/// already validated and started executing.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct PendingBlock {
     order: FinalizedOrder,
     parent_id: Hash,
     payload_id: Hash,
     next_nonces: BTreeMap<Address, u64>,
+    transactions: Vec<ExecutableTransaction>,
 }
 
 /// Restart-safe finalized-block execution and application-state commit pipeline.
@@ -207,7 +214,7 @@ pub struct BlockLifecycle {
     validators: ValidatorSet,
     scheme: Arc<dyn AggregateSignatureScheme>,
     admission: TransactionValidator,
-    store: RocksDbStore,
+    store: Arc<RocksDbStore>,
     executor: DeferredExecutor,
     status: Arc<RwLock<NodeStatus>>,
     rpc_state: Arc<RwLock<StateTree>>,
@@ -239,7 +246,7 @@ impl BlockLifecycle {
         let validated = genesis.validate()?;
         let admission = TransactionValidator::from_genesis(genesis)?;
         std::fs::create_dir_all(data_directory.as_ref())?;
-        let store = RocksDbStore::open(data_directory)?;
+        let store = Arc::new(RocksDbStore::open(data_directory)?);
         let checkpoint = if let Some(bytes) = store.get(CHECKPOINT_KEY)? {
             let checkpoint = bcs::from_bytes::<DurableCheckpoint>(&bytes)
                 .map_err(|error| LifecycleError::Encoding(error.to_string()))?;
@@ -285,6 +292,36 @@ impl BlockLifecycle {
             worker_count,
             genesis.blocks_per_epoch,
         )?;
+        let mut submitted_height = checkpoint.finalized_height;
+        let mut submitted_block = checkpoint.finalized_block;
+        let mut admission_nonces = checkpoint.next_nonces;
+        let mut pending = BTreeMap::new();
+        // Replay any block that was validated and handed to the executor
+        // before a crash but never reached `poll_commit`'s atomic write. Each
+        // entry must extend the previous height by exactly one: the executor
+        // only ever runs blocks in strict submission order, so a gap or
+        // repeat here means the pending log is corrupt rather than merely
+        // stale, and is treated as unrecoverable rather than silently healed.
+        for (_, bytes) in store.iterate_prefix(PENDING_PREFIX)? {
+            let record: PendingBlock = bcs::from_bytes(&bytes)
+                .map_err(|error| LifecycleError::Encoding(error.to_string()))?;
+            if record.order.height != submitted_height.saturating_add(1) {
+                return Err(LifecycleError::PendingReplayGap {
+                    expected: submitted_height.saturating_add(1),
+                    found: record.order.height,
+                });
+            }
+            executor.submit(OrderedExecutionBlock {
+                height: record.order.height,
+                consensus_block_id: record.order.block_id,
+                transaction_ids: record.order.transaction_ids.clone(),
+                transactions: record.transactions.clone(),
+            })?;
+            submitted_height = record.order.height;
+            submitted_block = record.order.block_id;
+            admission_nonces = record.next_nonces.clone();
+            pending.insert(record.order.height, record);
+        }
         Ok(Self {
             genesis_hash: validated.genesis_hash,
             validators: validated.validators,
@@ -296,10 +333,10 @@ impl BlockLifecycle {
             rpc_state,
             committed_height: checkpoint.finalized_height,
             committed_block: checkpoint.finalized_block,
-            submitted_height: checkpoint.finalized_height,
-            submitted_block: checkpoint.finalized_block,
-            admission_nonces: checkpoint.next_nonces,
-            pending: BTreeMap::new(),
+            submitted_height,
+            submitted_block,
+            admission_nonces,
+            pending,
             completed: None,
         })
     }
@@ -366,24 +403,33 @@ impl BlockLifecycle {
             return Err(LifecycleError::OrderMismatch);
         }
         let payload_id = payload.payload_id()?;
-        self.executor.submit(OrderedExecutionBlock {
-            height: order.height,
-            consensus_block_id: order.block_id,
-            transaction_ids,
+        let height = order.height;
+        let pending = PendingBlock {
+            order,
+            parent_id: payload.parent_id,
+            payload_id,
+            next_nonces,
             transactions: executable,
-        })?;
-        self.submitted_height = order.height;
-        self.submitted_block = order.block_id;
-        self.admission_nonces = next_nonces.clone();
-        self.pending.insert(
-            order.height,
-            PendingBlock {
-                order,
-                parent_id: payload.parent_id,
-                payload_id,
-                next_nonces,
-            },
-        );
+        };
+        // Durably record the block before handing it to the executor so a
+        // crash never strands a validated, in-flight block: on restart the
+        // record is replayed and resubmitted rather than lost, sparing the
+        // node from having to wait for the network to resend it.
+        self.store
+            .put(&pending_key(height), &canonical_bytes(&pending)?)?;
+        if let Err(error) = self.executor.submit(OrderedExecutionBlock {
+            height,
+            consensus_block_id: pending.order.block_id,
+            transaction_ids,
+            transactions: pending.transactions.clone(),
+        }) {
+            let _ = self.store.delete(&pending_key(height));
+            return Err(error.into());
+        }
+        self.submitted_height = height;
+        self.submitted_block = pending.order.block_id;
+        self.admission_nonces = pending.next_nonces.clone();
+        self.pending.insert(height, pending);
         Ok(())
     }
 
@@ -440,7 +486,8 @@ impl BlockLifecycle {
         let mut batch = WriteBatch::new();
         batch
             .put(block_key(record.height), canonical_bytes(&record)?)
-            .put(CHECKPOINT_KEY, canonical_bytes(&checkpoint)?);
+            .put(CHECKPOINT_KEY, canonical_bytes(&checkpoint)?)
+            .delete(pending_key(record.height));
         self.store.write_batch(batch)?;
 
         let restored = StateTree::from_durable_snapshot(snapshot.clone())?;
@@ -496,6 +543,14 @@ impl BlockLifecycle {
     pub fn admission_nonces(&self) -> BTreeMap<Address, u64> {
         self.admission_nonces.clone()
     }
+
+    /// Shares this node's single durable store with other components (the
+    /// Stage 2 pipeline's pre-consensus admission log) instead of opening a
+    /// second `RocksDB` instance for the same process.
+    #[must_use]
+    pub fn store_handle(&self) -> Arc<RocksDbStore> {
+        Arc::clone(&self.store)
+    }
 }
 
 fn admit(
@@ -550,6 +605,13 @@ fn block_key(height: u64) -> Vec<u8> {
     key
 }
 
+fn pending_key(height: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(PENDING_PREFIX.len() + 8);
+    key.extend_from_slice(PENDING_PREFIX);
+    key.extend_from_slice(&height.to_be_bytes());
+    key
+}
+
 fn canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, LifecycleError> {
     bcs::to_bytes(value).map_err(|error| LifecycleError::Encoding(error.to_string()))
 }
@@ -600,4 +662,6 @@ pub enum LifecycleError {
     CommitRootMismatch,
     #[error("shared RPC state lock was poisoned")]
     LockPoisoned,
+    #[error("durable pending-block log is corrupt: expected height {expected}, found {found}")]
+    PendingReplayGap { expected: u64, found: u64 },
 }

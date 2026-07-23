@@ -227,6 +227,70 @@ fn rent_epoch_advances_automatically_and_survives_restart() {
     assert!(final_state.expired_object(&rented.id).is_some());
 }
 
+#[test]
+fn finalized_block_submitted_before_a_crash_still_commits_after_restart() {
+    let directory = TempDir::new().unwrap();
+    let account_key = [7_u8; 32];
+    let account_scheme = Ed25519Scheme;
+    let account_public_key = account_scheme.public_key(&account_key).unwrap();
+    let owner = account_scheme.address(&account_public_key).unwrap();
+    let first = object(1, owner);
+    let (genesis, validator_keys) = genesis(vec![first.clone()]);
+    let validated = genesis.validate().unwrap();
+    let status = status(&genesis, validated.genesis_hash, validated.state_root);
+    let shared_state = Arc::new(RwLock::new(StateTree::new(StateConfig::default()).unwrap()));
+
+    let payload = PropagatedBlock {
+        height: 1,
+        parent_id: validated.genesis_hash,
+        transactions: vec![signed_mutation(
+            &account_key,
+            &account_public_key,
+            owner,
+            0,
+            &first,
+            0,
+            42,
+        )],
+    };
+    let order = finalized_order(&genesis, &validator_keys, &payload);
+
+    {
+        let mut lifecycle = BlockLifecycle::open(
+            &genesis,
+            directory.path(),
+            Arc::clone(&status),
+            Arc::clone(&shared_state),
+            100,
+            4,
+        )
+        .unwrap();
+        lifecycle.submit_payload(order, &payload).unwrap();
+        // The process ends here: the block was validated and handed to the
+        // executor, but `poll_commit` never ran, so the durable checkpoint
+        // still shows height 0. Only the pending-block record persisted by
+        // `submit_payload` can recover it.
+    }
+
+    let mut lifecycle = BlockLifecycle::open(
+        &genesis,
+        directory.path(),
+        Arc::clone(&status),
+        Arc::clone(&shared_state),
+        100,
+        4,
+    )
+    .unwrap();
+    assert_eq!(lifecycle.committed_height(), 0);
+    let record = wait_for_commit(&mut lifecycle);
+    assert_eq!(record.height, 1);
+    assert_eq!(lifecycle.committed_height(), 1);
+    assert_eq!(
+        shared_state.read().unwrap().object(&first.id).unwrap().data,
+        vec![42]
+    );
+}
+
 fn wait_for_commit(lifecycle: &mut BlockLifecycle) -> node::DurableBlockRecord {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

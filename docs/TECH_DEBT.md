@@ -17,23 +17,49 @@ Priority meanings:
 
 ### TD-001 — Byzantine safety campaign cannot observe conflicting node decisions
 
-- **Priority:** High correctness-assurance gap; blocks treating the aggregate
-  simulator as an exhaustive safety proof.
-- **Introduced:** Phase 4; carried into the Phase 6 chaos campaign. Exact commit
-  unavailable. Sources: `phase-4-status.md`, `phase-6-status.md`, and
-  `testkit::ConsensusSimulator`.
-- **Why deferred/exposed:** The deterministic simulator returns one aggregate
-  finalization result for a height, so its ordinary scenario result cannot
-  observe two honest nodes finalizing different blocks at the same height. The
-  campaign now separately runs the selective-delivery fast-certificate attack
-  through production `Replica`/certificate code, and the five-process socket
-  test compares independent finalized RPC observations under leader
-  equivocation. Those close the concrete attack found in review but do not make
-  the aggregate simulator a general per-node state-space explorer.
-- **Expected resolution:** Model per-validator replicas, message delivery, locks,
-  and finalization observations under equivocation/partitions, then assert
-  pairwise agreement at every height. Continue using independent observations
-  in the real multi-process and external chaos harnesses.
+- **Priority:** Medium; narrowed from High. A genuine per-validator,
+  randomized exploration now exists and runs as part of the chaos campaign;
+  `ConsensusSimulator`'s original single-aggregate-outcome model (used for the
+  broader fault/liveness sweep across all 11 existing call sites) is
+  unchanged, since generalizing it fully would have required re-deriving its
+  closed-form latency/certificate semantics with real risk of silently
+  breaking existing timing assertions across five call sites for no added
+  safety value.
+- **Introduced:** Phase 4; carried into the Phase 6 chaos campaign; narrowed
+  post-Phase-6. Sources: `phase-4-status.md`, `phase-6-status.md`,
+  `testkit::ConsensusSimulator`, `testkit::explore_equivocating_proposal_safety`.
+- **Why deferred/exposed:** The deterministic simulator still returns one
+  aggregate finalization result per height for its main fault/liveness sweep.
+  Added alongside it: `explore_equivocating_proposal_safety`, which builds a
+  real, independent, production `consensus::Replica` for every honest
+  validator in a freshly randomized validator set each trial, has an
+  equivocating leader sign two different proposals for the same height/view,
+  splits the honest validators into two randomized delivery groups (one per
+  proposal), drives every honest validator's vote and finalization decision
+  through its own real `Replica` (this function only routes messages — it
+  never signs on an honest validator's behalf), and asserts pairwise
+  agreement: no two independent honest replicas may finalize different blocks
+  at the same height, and the two delivery groups may not both independently
+  reach an 80% fast certificate. Verified the detection logic is real, not
+  vacuous: temporarily busting the enforced <20% Byzantine budget in this
+  function caused it to correctly catch 24 genuine cross-replica
+  disagreements out of 200 randomized trials; restored to the correct budget,
+  200 trials (each with a fresh random validator count, Byzantine subset, and
+  delivery split) find zero violations, run as part of
+  `ChaosCampaign::run_simulated` and asserted in
+  `chaos::tests::hundred_scenario_campaign_has_no_safety_or_liveness_failure`.
+  This generalizes the single hand-crafted `production_cross_view_fast_safety`
+  scenario (which tests a related but different property: that a formed fast
+  certificate's voters cannot also form a competing timeout certificate) into
+  an actual randomized per-node state-space exploration, using real Replica
+  code throughout rather than one aggregate outcome.
+- **Expected resolution:** Extend per-validator replica modeling to partition
+  and message-drop fault dimensions (today's addition covers equivocation
+  specifically), and consider whether the main `ConsensusSimulator` sweep
+  should eventually move to the same per-replica model — weighed against the
+  risk of disturbing its five existing call sites' timing assumptions.
+  Continue using independent per-node observations in the real multi-process
+  and external chaos harnesses as well.
 
 ### TD-002 — Consensus is not wired to the durable application lifecycle
 
@@ -203,7 +229,9 @@ Priority meanings:
 
 ### TD-012 — State synchronization, in-flight recovery, and pruning are incomplete
 
-- **Priority:** High.
+- **Priority:** High; narrowed. Both in-flight recovery gaps identified in the
+  original deferral are now closed and tested; snapshot transfer,
+  cross-network sync, and pruning remain untouched.
 - **Introduced:** Phase 1 explicit deferral; remains a Phase 6 promotion blocker.
   Exact commit unavailable. Sources: `phase-1-status.md`, `state-spec.md`, and
   `phase-6-status.md`.
@@ -211,15 +239,27 @@ Priority meanings:
   finalized block record, certificate, nonces, and root-bound full-state
   snapshot, restores it before execution, and rejects snapshot tampering, and
   the production `node` binary now drives it directly (see TD-002). An
-  accepted-but-not-yet-finalized transaction or a finalized-but-not-yet-committed
-  block must still be reproposed/regossiped after restart rather than being
-  replayed from durable storage. There is still no authenticated snapshot
-  transfer to a late-joining node, no cross-network state-sync protocol, and no
-  pruning policy.
-- **Expected resolution:** Persist/replay in-flight admitted and finalized
-  payloads (shared scope with TD-005/TD-015), add authenticated snapshot and
-  block-history transfer for late-joining nodes, define retention/pruning, and
-  measure bootstrap and crash-recovery bounds.
+  accepted-but-not-yet-finalized transaction is now durably logged and replayed
+  on restart (TD-015). A finalized-but-not-yet-committed block — validated,
+  handed to `DeferredExecutor`, but not yet through `poll_commit`'s atomic
+  write when a crash occurs — is now also durably recorded before submission
+  (`BlockLifecycle::submit_payload` in `crates/node/src/lifecycle.rs`) and
+  atomically cleared in the same `WriteBatch` as the commit. On restart,
+  `BlockLifecycle::open` replays any leftover record straight back into a
+  freshly created executor, requiring strict height contiguity from the last
+  committed checkpoint and failing closed (`LifecycleError::PendingReplayGap`)
+  on any gap rather than silently continuing — this path no longer depends on
+  the network resending a block the node already validated. Covered by
+  `finalized_block_submitted_before_a_crash_still_commits_after_restart` in
+  `crates/node/tests/block_lifecycle.rs`, verified to fail without the fix.
+  There is still no authenticated snapshot transfer to a late-joining node, no
+  cross-network state-sync protocol, and no pruning policy — these are
+  materially larger, riskier features than the two recovery gaps just closed
+  and remain open design questions rather than narrow bugs.
+- **Expected resolution:** Design and add authenticated snapshot and
+  block-history transfer for late-joining nodes, define a retention/pruning
+  policy, define a cross-network state-sync protocol, and measure bootstrap and
+  crash-recovery bounds end-to-end.
 
 ### TD-013 — Epoch transitions and validator reconfiguration are incomplete
 
@@ -301,20 +341,39 @@ Priority meanings:
 
 ### TD-015 — Mempool and application sequencing remain in-memory and disconnected
 
-- **Priority:** High for integrated operation; Medium for the isolated Phase 5
-  data structure.
-- **Introduced:** Phase 5 explicit deferral. Exact commit unavailable. Sources:
-  `mempool-spec.md` and `phase-5-status.md`.
-- **Why deferred:** Validated libp2p gossip and RPC ingress are now wired into
-  the localized mempool via the shared `Stage2Pipeline` admission path (see
-  TD-002/TD-005), closing the "no networking/RPC ingress" half of this item.
-  There is still no durable admission store (an admitted transaction is only
-  held in process memory) and application ordering policies remain immutable
-  in-process registrations. TEE fair ordering, encryption, cross-scope policy,
-  and adversarial scheduler infrastructure remain explicitly out of the base
-  implementation.
-- **Expected resolution:** Persist admitted transactions and policy versions
-  (shared scope with TD-012), define eviction/rebroadcast/restart rules, stress
+- **Priority:** Medium; narrowed from High. The durable-admission half is
+  closed; application ordering-policy versioning and the TEE/adversarial-load
+  scope remain open.
+- **Introduced:** Phase 5 explicit deferral; durable admission closed
+  post-Phase-6. Sources: `mempool-spec.md`, `phase-5-status.md`,
+  `crates/node/src/pipeline.rs`.
+- **Why deferred/exposed:** Validated libp2p gossip and RPC ingress are wired
+  into the localized mempool via the shared `Stage2Pipeline` admission path
+  (see TD-002/TD-005). An admitted-but-not-yet-finalized transaction is now
+  also durably logged: `PipelineProposalSource::admit` persists the signed
+  transaction to the node's single `RocksDB` store (shared with
+  `BlockLifecycle` via `BlockLifecycle::store_handle` rather than opening a
+  second store) before touching any in-memory mempool state, so a storage
+  failure aborts admission with nothing partial to unwind. `note_committed`
+  and `rollback` remove the durable entry once it is no longer needed.
+  `Stage2Pipeline::new` replays every persisted entry on startup by calling
+  the same `admit` path against the freshly restored nonces, so a
+  transaction already finalized before the crash is naturally rejected as
+  stale (not silently reinstated) rather than needing separate
+  cross-referencing logic. A dedicated test proves this across a real
+  drop-and-reopen of every component holding the store (standing in for a
+  process crash): admit, tear down without ever finalizing, reopen at the
+  same data directory, and confirm the transaction is proposable again with
+  no resubmission -- verified to actually depend on the replay logic by
+  disabling it and confirming the test fails first. Still open: application
+  ordering policies (`OrderingPolicy` registrations) remain immutable
+  in-process state, not versioned or persisted; TEE fair ordering, encryption,
+  cross-scope policy, and adversarial scheduler infrastructure remain
+  explicitly out of the base implementation; and stress-testing localized
+  fees under adversarial load (distinct from the durability property closed
+  here) has not been done.
+- **Expected resolution:** Persist and version `OrderingPolicy` registrations
+  (shared next step with TD-012's broader state-sync/pruning scope), stress
   localized fees and hooks under adversarial load, and scope any TEE or
   encrypted ordering design as a separately reviewed subsystem.
 

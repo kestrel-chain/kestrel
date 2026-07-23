@@ -47,10 +47,13 @@ formats, and any root mismatch.
 The Phase 6 node lifecycle atomically stores this root-bound snapshot with the
 finalized block record, aggregate certificate, and admission nonces. The tree
 remains in memory while executing, but a restarted lifecycle restores the last
-committed application root before accepting the next height. Authenticated
-snapshot transfer, late-join state synchronization, in-flight block recovery,
-and pruning remain separate Stage 2/3 work. Parallel and cross-VM execution must
-not change state-transition or root semantics.
+committed application root before accepting the next height. A block that was
+validated and handed to the executor but not yet committed when a crash occurs
+is durably recorded before submission and replayed into a fresh executor on
+restart (see `docs/TECH_DEBT.md` TD-012), so recovery no longer depends on the
+network resending it. Authenticated snapshot transfer, late-join state
+synchronization, and pruning remain separate Stage 2/3 work. Parallel and
+cross-VM execution must not change state-transition or root semantics.
 
 `DeferredExecutor` now drives epoch advancement automatically: before executing
 a block's transactions it advances state to `height / blocks_per_epoch`, so

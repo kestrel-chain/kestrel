@@ -14,4 +14,4 @@ The compute limit reserves eligibility but does not determine payment. Settlemen
 
 An application may register a deterministic `OrderingPolicy` for its own object or account scope. The policy compares admitted transactions and may inspect opaque application policy data. Policy registration is immutable for the running instance; replacement requires an explicit higher-level transition. The default policy sorts priority fee descending, then arrival sequence and transaction ID ascending.
 
-TEE-based fair ordering, encrypted mempools, cross-scope application policies, durable admission storage, and network ingress integration are deferred.
+Network/RPC ingress is wired into this admission path in the production node (see `docs/TECH_DEBT.md` TD-002/TD-005), and an admitted-but-not-yet-finalized transaction is durably logged so it survives a restart (TD-015). TEE-based fair ordering, encrypted mempools, cross-scope application policies, and versioned/persisted `OrderingPolicy` registrations remain deferred.

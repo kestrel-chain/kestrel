@@ -5,7 +5,8 @@ mod consensus_sim;
 
 pub use chaos::{
     ChaosAction, ChaosCampaign, ChaosCampaignError, ChaosCampaignReport, ChaosObservation,
-    ChaosTarget,
+    ChaosTarget, EquivocationExplorationConfig, EquivocationExplorationReport,
+    explore_equivocating_proposal_safety,
 };
 
 pub use consensus_sim::{
