@@ -361,6 +361,7 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
     let mut handles = Vec::new();
     let mut object_states = Vec::new();
     let mut tasks = Vec::new();
+    let mut statuses = Vec::new();
     let crashes: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     for index in 0..VALIDATOR_COUNT {
@@ -462,6 +463,7 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
 
         handles.push(handle);
         object_states.push(shared_state);
+        statuses.push(status);
     }
 
     // Let the gossip mesh dial and stabilize before genesis time arrives.
@@ -482,7 +484,14 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
             .unwrap();
     }
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    // Generous because CI is the worst case for this test: an unoptimized debug
+    // build (BLS aggregate verification is enormously slower without
+    // optimisation) driving four full validators plus thirty transactions on a
+    // small, contended runner. The same work takes a couple of seconds on a
+    // fast multi-core dev machine, so a deadline tuned there is not a
+    // meaningful bound on CI. The diagnostic below distinguishes "slow" from
+    // "stalled" so a real hang still fails loudly rather than hiding here.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
     loop {
         let all_committed = object_states.iter().all(|state| {
             let state = state.read().unwrap();
@@ -506,10 +515,43 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
             tasks.iter().all(|task| !task.is_finished()),
             "a validator's pipeline or coordinator task crashed under concurrent independent-sender load: {reported:?}"
         );
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "not all independent transactions committed on every node in time"
-        );
+        // Report what the chain was actually doing. A stall with a huge
+        // view-change count is a very different failure from steady-but-slow
+        // progress, and the bare message could not tell them apart.
+        if tokio::time::Instant::now() >= deadline {
+            let progress = statuses
+                .iter()
+                .zip(object_states.iter())
+                .enumerate()
+                .map(|(node, (status, state))| {
+                    let status = status.read().unwrap();
+                    let state = state.read().unwrap();
+                    let committed = senders
+                        .iter()
+                        .filter(|sender| {
+                            state
+                                .object(&sender.object.id)
+                                .is_some_and(|object| object.data == vec![1])
+                        })
+                        .count();
+                    // `view_changes` is the view of the last *finalized* block,
+                    // not a live view counter, so it stays 0 while nothing has
+                    // committed. `height` is the real signal: 0 across every
+                    // node means a genuine stall, a rising height means the
+                    // chain is merely slow.
+                    format!(
+                        "node {node}: height={} last_finalized_view={} committed={}/{}",
+                        status.finalized_height,
+                        status.view_changes,
+                        committed,
+                        senders.len()
+                    )
+                })
+                .collect::<Vec<_>>();
+            panic!(
+                "not all independent transactions committed on every node in time: {progress:?}"
+            );
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let reported = crashes.lock().map_or_else(
