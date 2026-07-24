@@ -47,6 +47,23 @@ fn skip_when_view_already_timed_out(
     }
 }
 
+/// Round timeout for `view`, doubling each view up to `MAX_TIMEOUT_DOUBLINGS`.
+///
+/// A fixed round timeout cannot recover from an environment slower than it.
+/// Once rounds stop completing within it, replicas split -- some cast this
+/// view's order vote, the rest time out -- and because an honest replica may
+/// not cast both, neither side reaches its quorum. The view cannot advance and
+/// the height cannot finalize, so the chain makes no progress for as long as
+/// the condition lasts. Backing the timeout off per view is what partial
+/// synchrony relies on for liveness: it grows until it exceeds the real round
+/// time, at which point rounds complete again. The view resets to 0 on every
+/// committed height, so a healthy chain always runs at the base timeout.
+fn round_timeout_for_view(base: Duration, view: u64) -> Duration {
+    const MAX_TIMEOUT_DOUBLINGS: u32 = 6;
+    let doublings = u32::try_from(view).unwrap_or(MAX_TIMEOUT_DOUBLINGS);
+    base.saturating_mul(1_u32 << doublings.min(MAX_TIMEOUT_DOUBLINGS))
+}
+
 const SAFETY_STATE_KEY: &[u8] = b"consensus/replica-snapshot/v1";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 /// Gives transaction gossip one measured propagation window to reach the next
@@ -553,7 +570,7 @@ impl ConsensusCoordinator {
             }
         }
 
-        if round.started.elapsed() >= self.config.round_timeout
+        if round.started.elapsed() >= round_timeout_for_view(self.config.round_timeout, view)
             && !round.has(RoundFlag::TimeoutSent)
         {
             round.set(RoundFlag::TimeoutSent);
@@ -1098,6 +1115,14 @@ mod tests {
         ConsensusCoordinator, CoordinatorConfig, CoordinatorFaults, ProposalTransactionSource,
     };
 
+    /// Serialises the real-TCP consensus tests against each other. Each starts
+    /// five validators running BLS consensus in an unoptimized build; the test
+    /// harness runs tests in parallel, so two of them together put ten such
+    /// validators on the same cores. On a small CI runner that starves both,
+    /// producing round timeouts and extra view changes that say nothing about
+    /// the behaviour under test.
+    static REAL_TCP_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// Upper bound on real-TCP consensus rounds completing, not an expectation
     /// of how long they take: these finish in well under a second on an idle
     /// machine. It is generous because the value only matters when the machine
@@ -1105,7 +1130,7 @@ mod tests {
     /// small contended CI runner for reasons that have nothing to do with the
     /// property under test. Assertions after the wait still check the real
     /// behaviour, so a genuine hang fails on those rather than passing here.
-    const REAL_TCP_CONSENSUS_BOUND: Duration = Duration::from_secs(60);
+    const REAL_TCP_CONSENSUS_BOUND: Duration = Duration::from_secs(150);
 
     struct PipelineSource;
 
@@ -1158,6 +1183,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[allow(clippy::too_many_lines)] // Keep the full restart/continuation timeline visible for review.
     async fn five_real_tcp_nodes_finalize_the_same_two_heights() {
+        let _serialised = REAL_TCP_TESTS.lock().await;
         let directory = TempDir::new().unwrap();
         let (genesis, keys) = fixture_genesis(5);
         let validated = genesis.validate().unwrap();
@@ -1277,6 +1303,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[allow(clippy::too_many_lines)] // Keep the full fault timeline visible for safety review.
     async fn real_tcp_nodes_recover_after_leader_kill_with_a_corrupt_voter() {
+        let _serialised = REAL_TCP_TESTS.lock().await;
         let directory = TempDir::new().unwrap();
         let (mut genesis, keys) = fixture_genesis(5);
         let initial = genesis.validate().unwrap();
@@ -1377,7 +1404,18 @@ mod tests {
         .unwrap();
         assert_eq!(outcomes.len(), 4);
         assert!(outcomes.iter().all(|outcome| outcome.finalized_height == 1));
-        assert!(outcomes.iter().all(|outcome| outcome.view_changes == 1));
+        // The killed leader cannot finalize view 0, so recovery must take at
+        // least one view change. The exact number is timing-dependent -- a slow
+        // or contended machine times a round out again and lands a view or two
+        // later -- so asserting equality tested the machine, not the protocol.
+        // What must hold is that every survivor recovered and agreed on the
+        // same block in the same view, which the next two assertions cover.
+        assert!(outcomes.iter().all(|outcome| outcome.view_changes >= 1));
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.view_changes == outcomes[0].view_changes)
+        );
         assert!(
             outcomes
                 .iter()
