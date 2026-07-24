@@ -32,9 +32,112 @@ use rpc::NodeStatus;
 use state::{StateConfig, StateTree};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
+use tracing::Instrument;
 use types::{Address, Hash, Object, Owner, Transaction};
 
 const VALIDATOR_COUNT: usize = 4;
+/// Events kept from the start of the run and from the end of it. The start
+/// matters because a stall at height 0 is decided during startup; the end
+/// matters because a stall after progress is decided by whatever it was doing
+/// last. Keeping both bounded keeps a 180-second run's output readable.
+const LOG_HEAD: usize = 150;
+const LOG_TAIL: usize = 150;
+
+/// Bounded in-memory capture of the validators' own `tracing` events.
+///
+/// All four validators run in this one process, so their events interleave;
+/// each validator's tasks are wrapped in a span carrying its index to keep them
+/// attributable. Without this the test could only report the final *state* of a
+/// failure — four numbers per node — which says what went wrong but never why.
+#[derive(Clone, Default)]
+struct CapturedLog {
+    head: Arc<std::sync::Mutex<Vec<String>>>,
+    tail: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+}
+
+impl CapturedLog {
+    fn record(&self, line: &str) {
+        let line = line.trim_end();
+        if line.is_empty() {
+            return;
+        }
+        {
+            let mut head = self
+                .head
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if head.len() < LOG_HEAD {
+                head.push(line.to_owned());
+            }
+        }
+        let mut tail = self
+            .tail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if tail.len() >= LOG_TAIL {
+            tail.pop_front();
+        }
+        tail.push_back(line.to_owned());
+    }
+
+    fn dump(&self) -> String {
+        let head = self
+            .head
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .join("\n");
+        let tail = self
+            .tail
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("\n===== first events =====\n{head}\n===== last events =====\n{tail}\n")
+    }
+}
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.record(&String::from_utf8_lossy(buf));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLog {
+    type Writer = Self;
+
+    fn make_writer(&self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Installs the capturing subscriber once per test binary and returns it. A
+/// global subscriber can only be set once, so every test in this binary shares
+/// it; the long-running test dominates the tail, and spans identify the source.
+static CAPTURED: std::sync::OnceLock<CapturedLog> = std::sync::OnceLock::new();
+
+fn captured_log() -> CapturedLog {
+    CAPTURED
+        .get_or_init(|| {
+            let capture = CapturedLog::default();
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::new(
+                    "node=debug,consensus=debug",
+                ))
+                .with_writer(capture.clone())
+                .with_ansi(false)
+                .with_target(false)
+                .try_init();
+            capture
+        })
+        .clone()
+}
 
 /// Records why a validator task ended, tolerating a poisoned mutex so one
 /// panicking task cannot bury the original failure behind `PoisonError`.
@@ -278,6 +381,7 @@ async fn stage2_pipeline_commits_a_gossiped_transaction_across_all_nodes() {
 #[allow(clippy::too_many_lines)] // Keep the full multi-node wiring/assertion timeline auditable.
 async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
     const TRANSACTION_COUNT: usize = 30;
+    let log = captured_log();
     let directory = TempDir::new().unwrap();
 
     let senders = (0..TRANSACTION_COUNT)
@@ -458,25 +562,31 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
         // report "something crashed", which is useless on a CI runner where the
         // race reproduces but the machine isn't available to debug.
         let coordinator_crashes = Arc::clone(&crashes);
-        tasks.push(tokio::spawn(async move {
-            let reason = match coordinator.run(genesis_time).await {
-                Ok(outcome) => format!(
-                    "validator {index} coordinator exited unexpectedly at height {}",
-                    outcome.finalized_height
-                ),
-                Err(error) => format!("validator {index} coordinator failed: {error}"),
-            };
-            record_crash(&coordinator_crashes, reason);
-        }));
-        let pipeline_crashes = Arc::clone(&crashes);
-        tasks.push(tokio::spawn(async move {
-            if let Err(error) = pipeline.run().await {
-                record_crash(
-                    &pipeline_crashes,
-                    format!("validator {index} pipeline failed: {error}"),
-                );
+        tasks.push(tokio::spawn(
+            async move {
+                let reason = match coordinator.run(genesis_time).await {
+                    Ok(outcome) => format!(
+                        "validator {index} coordinator exited unexpectedly at height {}",
+                        outcome.finalized_height
+                    ),
+                    Err(error) => format!("validator {index} coordinator failed: {error}"),
+                };
+                record_crash(&coordinator_crashes, reason);
             }
-        }));
+            .instrument(tracing::info_span!("validator", node = index)),
+        ));
+        let pipeline_crashes = Arc::clone(&crashes);
+        tasks.push(tokio::spawn(
+            async move {
+                if let Err(error) = pipeline.run().await {
+                    record_crash(
+                        &pipeline_crashes,
+                        format!("validator {index} pipeline failed: {error}"),
+                    );
+                }
+            }
+            .instrument(tracing::info_span!("validator", node = index)),
+        ));
     }
 
     // Let the gossip mesh dial and stabilize before genesis time arrives.
@@ -581,7 +691,8 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
                 })
                 .collect::<Vec<_>>();
             panic!(
-                "not all independent transactions committed on every node in time: {progress:?}"
+                "not all independent transactions committed on every node in time: {progress:?}{}",
+                log.dump()
             );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -593,6 +704,217 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
     assert!(
         tasks.iter().all(|task| !task.is_finished()),
         "a validator's pipeline or coordinator task crashed under concurrent independent-sender load: {reported:?}"
+    );
+
+    for task in tasks {
+        task.abort();
+    }
+}
+
+/// A validator can only execute a height it did not propose once that block's
+/// payload reaches it as shreds. When that stops happening its execution stops
+/// with it — but consensus needs only transaction IDs, so the validator kept
+/// voting and finalizing regardless, accumulating certified orders it could
+/// never execute. Observed on CI: ordering reached height 542 while execution
+/// sat at 0, the backlog growing without bound, the validator still advertising
+/// itself as healthy while its state was frozen at genesis.
+///
+/// `consensus-spec` requires the opposite: a node coordinator must stop
+/// admitting ordered payloads once execution falls behind. This drives that
+/// condition directly by silencing every shred path, and asserts the validator
+/// now reports the backlog rather than absorbing it silently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[allow(clippy::too_many_lines)]
+async fn execution_falling_behind_ordering_is_reported_not_absorbed_silently() {
+    let directory = TempDir::new().unwrap();
+    let bls = Bls12381Scheme;
+    let mut bls_keys = Vec::new();
+    let mut libp2p_identities = Vec::new();
+    let mut validators = Vec::new();
+    let gossip_ports = (0..VALIDATOR_COUNT)
+        .map(|_| reserve_port())
+        .collect::<Vec<_>>();
+    for index in 1..=VALIDATOR_COUNT {
+        let key = vec![u8::try_from(index).unwrap(); 32];
+        let public_key = bls.public_key(&key).unwrap();
+        bls_keys.push(key.clone());
+        let gossip_identity = identity::Keypair::generate_ed25519();
+        let gossip_peer_id = gossip_identity.public().to_peer_id().to_string();
+        libp2p_identities.push(gossip_identity);
+        validators.push(GenesisValidator {
+            name: format!("validator-{index}"),
+            validator: Validator {
+                id: Hash::digest([u8::try_from(index).unwrap()]),
+                stake: 20,
+                public_key,
+                proof_of_possession: bls.proof_of_possession(&key).unwrap(),
+            },
+            network_address: reserve_socket_address(),
+            rpc_address: reserve_socket_address(),
+            gossip_peer_id,
+            gossip_address: format!("/ip4/127.0.0.1/tcp/{}", gossip_ports[index - 1]),
+        });
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let genesis = GenesisDocument {
+        format_version: GENESIS_FORMAT_VERSION,
+        chain_id: "kestrel-stage2-backpressure-test".to_owned(),
+        genesis_unix_ms: u64::try_from(now).unwrap() + 1_500,
+        blocks_per_epoch: 100,
+        state_config: StateConfig::default(),
+        active_signature_schemes: vec![1, 2],
+        equivocation_slash_basis_points: 5_000,
+        validators: validators.clone(),
+        initial_objects: Vec::new(),
+        initial_fee_balances: BTreeMap::new(),
+    };
+    let validated = genesis.validate().unwrap();
+    let peer_ids = libp2p_identities
+        .iter()
+        .map(identity::Keypair::public)
+        .map(|key| key.to_peer_id())
+        .collect::<Vec<_>>();
+    let validator_peers: BTreeMap<Hash, PeerId> = validators
+        .iter()
+        .zip(peer_ids.iter())
+        .map(|(entry, peer_id)| (entry.validator.id, *peer_id))
+        .collect();
+
+    let mut tasks = Vec::new();
+    let mut built = Vec::new();
+    let crashes: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    for index in 0..VALIDATOR_COUNT {
+        let status = Arc::new(RwLock::new(NodeStatus {
+            chain_id: genesis.chain_id.clone(),
+            genesis_hash: validated.genesis_hash,
+            finalized_height: 0,
+            committed_height: 0,
+            finalized_block: validated.genesis_hash,
+            state_root: validated.state_root,
+            peer_count: 0,
+            ready: false,
+            finality_latency_ms: None,
+            view_changes: 0,
+        }));
+        let shared_state = Arc::new(RwLock::new(StateTree::new(StateConfig::default()).unwrap()));
+        let lifecycle = BlockLifecycle::open(
+            &genesis,
+            directory.path().join(format!("app-{index}")),
+            Arc::clone(&status),
+            Arc::clone(&shared_state),
+            100,
+            4,
+        )
+        .unwrap();
+        let configured_peers = (0..VALIDATOR_COUNT)
+            .filter(|other| *other != index)
+            .map(|other| ConfiguredPeer {
+                peer_id: peer_ids[other],
+                address: format!("/ip4/127.0.0.1/tcp/{}", gossip_ports[other])
+                    .parse::<Multiaddr>()
+                    .unwrap(),
+            })
+            .collect();
+        let network_node = NetworkNode::spawn(
+            libp2p_identities[index].clone(),
+            GossipConfig {
+                listen_address: format!("/ip4/127.0.0.1/tcp/{}", gossip_ports[index])
+                    .parse()
+                    .unwrap(),
+                configured_peers,
+                heartbeat_interval: Duration::from_millis(25),
+                // No validator can deliver a block payload, so every validator
+                // that did not propose a height is unable to execute it.
+                faults: network::NetworkFaults {
+                    shred_drop_basis_points: 10_000,
+                    ..network::NetworkFaults::default()
+                },
+                ..GossipConfig::default()
+            },
+        )
+        .unwrap();
+        let (finalized_order_sender, finalized_order_receiver) = mpsc::unbounded_channel();
+        let (pipeline, _handle) = Stage2Pipeline::new(
+            &genesis,
+            network_node,
+            lifecycle,
+            validator_peers.clone(),
+            finalized_order_receiver,
+            Stage2PipelineConfig {
+                // Small enough to reach quickly; the production default is far
+                // larger and the property under test is identical.
+                maximum_pending_orders: 8,
+                ..Stage2PipelineConfig::default()
+            },
+        )
+        .unwrap();
+        let proposal_source = pipeline.proposal_source();
+        let coordinator = ConsensusCoordinator::bind_with_pipeline(
+            &genesis,
+            validators[index].validator.id,
+            bls_keys[index].clone(),
+            directory.path().join(format!("consensus-{index}")),
+            Arc::clone(&status),
+            CoordinatorConfig::default(),
+            CoordinatorFaults::default(),
+            proposal_source,
+            finalized_order_sender,
+        )
+        .await
+        .unwrap();
+        built.push((index, coordinator, pipeline));
+    }
+
+    let genesis_time = genesis.genesis_unix_ms;
+    for (index, coordinator, pipeline) in built {
+        let coordinator_crashes = Arc::clone(&crashes);
+        tasks.push(tokio::spawn(async move {
+            if let Err(error) = coordinator.run(genesis_time).await {
+                record_crash(
+                    &coordinator_crashes,
+                    format!("validator {index} coordinator failed: {error}"),
+                );
+            }
+        }));
+        let pipeline_crashes = Arc::clone(&crashes);
+        tasks.push(tokio::spawn(async move {
+            if let Err(error) = pipeline.run().await {
+                record_crash(
+                    &pipeline_crashes,
+                    format!("validator {index} pipeline failed: {error}"),
+                );
+            }
+        }));
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let reported = loop {
+        let reported = crashes.lock().map_or_else(
+            |poisoned| poisoned.into_inner().clone(),
+            |guard| guard.clone(),
+        );
+        if reported
+            .iter()
+            .any(|reason| reason.contains("execution has fallen too far behind ordering"))
+        {
+            break reported;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a validator whose execution had stalled kept accepting certified orders instead of \
+             reporting the backlog: {reported:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        reported
+            .iter()
+            .any(|reason| reason.contains("still waiting to execute height")),
+        "the backlog report must name the height execution is stuck on: {reported:?}"
     );
 
     for task in tasks {

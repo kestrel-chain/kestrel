@@ -401,8 +401,18 @@ impl ConsensusCoordinator {
                     .proposal_source
                     .transaction_ids(height, self.replica.parent_id())
                 else {
+                    // The leader has nothing to propose, so this height cannot
+                    // start until it does. If every leader in turn reports this,
+                    // the chain stops at a height with no other symptom.
+                    debug!(height, view, "leader has no proposal available");
                     return Ok(None);
                 };
+                debug!(
+                    height,
+                    view,
+                    transaction_count = transaction_ids.len(),
+                    "proposing as leader"
+                );
                 let proposal = Proposal::new(
                     height,
                     view,
@@ -458,6 +468,7 @@ impl ConsensusCoordinator {
                 if self.faults.corrupt_votes && !vote.signature.is_empty() {
                     vote.signature[0] ^= 1;
                 }
+                debug!(height, view, %proposer, "voting on observed proposal");
                 self.send(proposer, WireMessage::Vote(vote)).await;
             } else {
                 debug!(
@@ -546,6 +557,7 @@ impl ConsensusCoordinator {
             && !round.has(RoundFlag::TimeoutSent)
         {
             round.set(RoundFlag::TimeoutSent);
+            debug!(height, view, "round timed out");
             if let Some(vote) = self.replica.local_timeout()? {
                 self.persist()?;
                 let next_leader = self.validators.leader(height, view.saturating_add(1)).id;
@@ -574,6 +586,7 @@ impl ConsensusCoordinator {
                 fee_commitment: None,
             })
             .await;
+            debug!(height, view, "timeout certificate formed; advancing view");
             self.replica.advance_view(&certificate)?;
             self.persist()?;
             *round = RoundState::new();
@@ -709,6 +722,11 @@ impl ConsensusCoordinator {
                         if certificate.height == self.replica.height()
                             && certificate.view == self.replica.view()
                         {
+                            debug!(
+                                height = certificate.height,
+                                view = certificate.view,
+                                "received timeout certificate; advancing view"
+                            );
                             self.replica.advance_view(&certificate)?;
                             self.persist()?;
                             *round = RoundState::new();
@@ -757,6 +775,11 @@ impl ConsensusCoordinator {
         }
         let finalized_height = certificate.height;
         let finalized_block = self.replica.finalize(certificate)?;
+        debug!(
+            height = finalized_height,
+            view = certificate.view,
+            "finalized height"
+        );
         self.persist()?;
         let latency = u64::try_from(round.height_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let outcome = CoordinatorOutcome {

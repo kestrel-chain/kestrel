@@ -14,7 +14,7 @@ use network::{
 use storage::{KvStore, RocksDbStore, StorageError};
 use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinHandle, time::MissedTickBehavior};
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 use types::{Address, Hash, Transaction};
 
 use crate::{
@@ -39,6 +39,19 @@ pub struct Stage2PipelineConfig {
     /// store and re-applied on restart (TD-014), but are not shared across
     /// nodes and never automatically expire.
     pub peer_offense_ban_threshold: u32,
+    /// Certified orders this validator may hold undelivered to execution before
+    /// it stops and reports failure.
+    ///
+    /// Deferred execution means ordering legitimately runs a little ahead of
+    /// execution, so this is a backlog bound rather than the strict one-block
+    /// bound `consensus-spec` describes for the executor's own channel. What it
+    /// prevents is the unbounded case: when execution stops entirely, the
+    /// validator kept accepting certified orders forever, growing this backlog
+    /// without limit while continuing to vote and finalize — presenting to the
+    /// rest of the network as a healthy validator whose state was frozen and
+    /// whose RPC served stale data indefinitely. Exceeding the bound is a real
+    /// local failure, so it is reported rather than absorbed silently.
+    pub maximum_pending_orders: usize,
 }
 
 impl Default for Stage2PipelineConfig {
@@ -54,6 +67,10 @@ impl Default for Stage2PipelineConfig {
             maximum_inflight_shred_blocks: 64,
             commit_poll_interval: Duration::from_millis(2),
             peer_offense_ban_threshold: 8,
+            // Comfortably above the few heights ordering normally leads
+            // execution by, and far below the hundreds seen when execution has
+            // actually stopped.
+            maximum_pending_orders: 64,
         }
     }
 }
@@ -154,6 +171,7 @@ impl Stage2Pipeline {
             || config.relay_count == 0
             || config.replication_factor == 0
             || config.maximum_inflight_shred_blocks == 0
+            || config.maximum_pending_orders == 0
             || config.commit_poll_interval.is_zero()
         {
             return Err(PipelineError::InvalidConfiguration);
@@ -303,7 +321,25 @@ impl Stage2Pipeline {
                 }
                 Some(order) = self.finalized_orders.recv() => {
                     self.pending_orders.insert(order.height, order);
+                    // Drain first: a backlog that clears is ordinary deferred
+                    // execution, not a fault. Only what remains afterwards
+                    // counts against the bound.
                     self.submit_available_orders()?;
+                    if self.pending_orders.len() > self.config.maximum_pending_orders {
+                        let awaiting_height = self.submitted_height.saturating_add(1);
+                        warn!(
+                            pending = self.pending_orders.len(),
+                            limit = self.config.maximum_pending_orders,
+                            awaiting_height,
+                            "execution has fallen too far behind ordering; stopping this validator \
+                             rather than continuing to finalize blocks it cannot execute"
+                        );
+                        return Err(PipelineError::ExecutionBacklogExceeded {
+                            pending: self.pending_orders.len(),
+                            limit: self.config.maximum_pending_orders,
+                            awaiting_height,
+                        });
+                    }
                 }
                 _ = ticker.tick() => {
                     self.submit_available_orders()?;
@@ -589,7 +625,9 @@ impl PipelineProposalSource {
         let sender = transaction.sender;
         state.reserved_senders.insert(sender, id);
         state.transactions.insert(id, transaction);
-        debug!(transaction_id = %id, %sender, "admitted transaction");
+        // One event per transaction per validator floods a debug capture,
+        // so this stays at trace; `profile_pipeline` enables trace to read it.
+        trace!(transaction_id = %id, %sender, "admitted transaction");
         Ok(id)
     }
 
@@ -848,6 +886,14 @@ pub enum PipelineError {
     PreviousHeightNotRetired { height: u64, retired_height: u64 },
     #[error("the in-flight shred-block limit was reached")]
     InflightShredLimitReached,
+    #[error(
+        "execution has fallen too far behind ordering: {pending} certified orders are undelivered to execution (limit {limit}), still waiting to execute height {awaiting_height}"
+    )]
+    ExecutionBacklogExceeded {
+        pending: usize,
+        limit: usize,
+        awaiting_height: u64,
+    },
     #[error("all Stage 2 pipeline inputs closed")]
     PipelineClosed,
     #[error("Stage 2 pipeline mutex was poisoned")]

@@ -195,7 +195,7 @@ fn run_once(validator_count: u8, transaction_count: usize) -> RepetitionResult {
                 "--data-dir",
                 data_path.to_str().unwrap(),
             ])
-            .env("RUST_LOG", "node=debug")
+            .env("RUST_LOG", "node=trace")
             .stdout(Stdio::from(fs::File::create(&log_paths[index]).unwrap()))
             .stderr(Stdio::null())
             .spawn()
