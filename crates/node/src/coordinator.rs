@@ -778,6 +778,7 @@ impl ConsensusCoordinator {
         debug!(
             height = finalized_height,
             view = certificate.view,
+            block = %finalized_block,
             "finalized height"
         );
         self.persist()?;
@@ -1097,6 +1098,15 @@ mod tests {
         ConsensusCoordinator, CoordinatorConfig, CoordinatorFaults, ProposalTransactionSource,
     };
 
+    /// Upper bound on real-TCP consensus rounds completing, not an expectation
+    /// of how long they take: these finish in well under a second on an idle
+    /// machine. It is generous because the value only matters when the machine
+    /// is slow, and a bound calibrated on an idle developer machine fails on a
+    /// small contended CI runner for reasons that have nothing to do with the
+    /// property under test. Assertions after the wait still check the real
+    /// behaviour, so a genuine hang fails on those rather than passing here.
+    const REAL_TCP_CONSENSUS_BOUND: Duration = Duration::from_secs(60);
+
     struct PipelineSource;
 
     impl ProposalTransactionSource for PipelineSource {
@@ -1190,7 +1200,7 @@ mod tests {
                 coordinator.run(genesis_time).await.unwrap()
             }));
         }
-        let outcomes = tokio::time::timeout(Duration::from_secs(8), async {
+        let outcomes = tokio::time::timeout(REAL_TCP_CONSENSUS_BOUND, async {
             let mut outcomes = Vec::new();
             for task in tasks {
                 outcomes.push(task.await.unwrap());
@@ -1248,7 +1258,7 @@ mod tests {
                 coordinator.run(genesis_time).await.unwrap()
             }));
         }
-        let restarted = tokio::time::timeout(Duration::from_secs(8), async {
+        let restarted = tokio::time::timeout(REAL_TCP_CONSENSUS_BOUND, async {
             let mut outcomes = Vec::new();
             for task in restarted {
                 outcomes.push(task.await.unwrap());
@@ -1354,7 +1364,7 @@ mod tests {
             .1
             .abort();
 
-        let outcomes = tokio::time::timeout(Duration::from_secs(8), async {
+        let outcomes = tokio::time::timeout(REAL_TCP_CONSENSUS_BOUND, async {
             let mut outcomes = Vec::new();
             for (id, task) in tasks {
                 if id != leader {

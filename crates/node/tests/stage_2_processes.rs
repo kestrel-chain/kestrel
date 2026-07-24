@@ -176,7 +176,12 @@ fn run_scenario(leader_fault: LeaderFault, voter_fault: VoterFault) {
         leader_process.child.wait().unwrap();
     }
 
-    let deadline = Instant::now() + Duration::from_secs(8);
+    // Generous on purpose: five real OS processes running BLS consensus in an
+    // unoptimized build finish this in about a second when the machine is idle,
+    // so a tight bound only ever fires on a slow or contended one, for reasons
+    // unrelated to the fault being tested. The assertions after the wait still
+    // verify the real behaviour.
+    let deadline = Instant::now() + Duration::from_secs(60);
     let statuses = loop {
         let statuses = children
             .iter()

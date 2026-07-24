@@ -132,6 +132,9 @@ async fn main() -> Result<()> {
             transaction_drop_basis_points: parse_optional(&arguments, "--tx-drop-bps")?
                 .unwrap_or(0),
             shred_drop_basis_points: parse_optional(&arguments, "--shred-drop-bps")?.unwrap_or(0),
+            shred_outage: Duration::from_millis(
+                parse_optional(&arguments, "--shred-outage-ms")?.unwrap_or(0),
+            ),
         };
         let network_node = NetworkNode::spawn(
             gossip_identity,

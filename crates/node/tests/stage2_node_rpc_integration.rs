@@ -52,6 +52,7 @@ fn node_binary_commits_an_rpc_submitted_transaction_across_all_processes() {
     let genesis_path = directory.path().join("genesis.json");
 
     let mut children = Vec::new();
+    let mut log_paths = Vec::new();
     for (index, entry) in genesis.validators.iter().enumerate() {
         let key_path = directory.path().join(format!("validator-{index}.key"));
         fs::write(&key_path, hex::encode(&keys[index])).unwrap();
@@ -62,6 +63,11 @@ fn node_binary_commits_an_rpc_submitted_transaction_across_all_processes() {
         )
         .unwrap();
         let data_path = directory.path().join(format!("data-{index}"));
+        // Keep each node's own consensus/pipeline events. Discarding them meant
+        // a hang here reported only "it never committed", with no way to tell
+        // whether ordering stopped, payloads never arrived, or execution stalled.
+        let log_path = directory.path().join(format!("node-{index}.log"));
+        log_paths.push(log_path.clone());
         let child = Command::new(env!("CARGO_BIN_EXE_node"))
             .args([
                 "run",
@@ -78,7 +84,8 @@ fn node_binary_commits_an_rpc_submitted_transaction_across_all_processes() {
                 "--data-dir",
                 data_path.to_str().unwrap(),
             ])
-            .stdout(Stdio::null())
+            .env("RUST_LOG", "node=trace,consensus=debug")
+            .stdout(Stdio::from(fs::File::create(&log_path).unwrap()))
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
@@ -99,7 +106,12 @@ fn node_binary_commits_an_rpc_submitted_transaction_across_all_processes() {
     // Generous under CI/full-workspace parallel load: each process still has to
     // finish tokio/libp2p/RocksDB startup, form the gossip mesh, and finalize
     // and commit its first (possibly empty) block before it reports ready.
-    let ready_deadline = Instant::now() + Duration::from_secs(40);
+    // Bounds on real OS processes booting and committing, not expectations:
+    // both are seconds when idle. Raised because a bound tuned on an idle
+    // machine fails on a contended one for reasons unrelated to the property
+    // under test -- this test timed out at 48s on a loaded machine while
+    // passing in well under 10s otherwise.
+    let ready_deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let ready = children
             .iter()
@@ -129,7 +141,7 @@ fn node_binary_commits_an_rpc_submitted_transaction_across_all_processes() {
         "transaction submission was rejected: {submit:?}"
     );
 
-    let commit_deadline = Instant::now() + Duration::from_secs(45);
+    let commit_deadline = Instant::now() + Duration::from_secs(120);
     loop {
         let committed = children
             .iter()
@@ -146,10 +158,39 @@ fn node_binary_commits_an_rpc_submitted_transaction_across_all_processes() {
         if committed == children.len() {
             break;
         }
-        assert!(
-            Instant::now() < commit_deadline,
-            "the RPC-submitted transaction did not commit on every process in time"
-        );
+        if Instant::now() >= commit_deadline {
+            // Print what each node was actually doing. Without this a hang here
+            // reports only that nothing committed, which cannot distinguish
+            // ordering stopping from payloads never arriving from execution
+            // stalling — the three causes look identical from the outside.
+            let logs = log_paths
+                .iter()
+                .enumerate()
+                .map(|(node, path)| {
+                    let text = fs::read_to_string(path).unwrap_or_default();
+                    // Everything about this transaction: where it was admitted,
+                    // and every block that was not empty. An empty result means
+                    // the node never saw it at all.
+                    let about_transaction = text
+                        .lines()
+                        .filter(|line| {
+                            line.contains("admitted transaction")
+                                || line.contains("finalized height")
+                                || (line.contains("transaction_count")
+                                    && !line.contains("\"transaction_count\":0"))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!("===== node {node} =====\n{about_transaction}")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            panic!(
+                "the RPC-submitted transaction did not commit on every process in time \
+                 ({committed}/{} committed)\n{logs}",
+                children.len()
+            );
+        }
         thread::sleep(Duration::from_millis(100));
     }
 

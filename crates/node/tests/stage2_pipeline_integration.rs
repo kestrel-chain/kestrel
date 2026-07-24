@@ -328,7 +328,7 @@ async fn stage2_pipeline_commits_a_gossiped_transaction_across_all_nodes() {
     // 45s, not 20s: this fixture runs four full tokio multi-threaded
     // runtimes with real libp2p/BLS, and a busy shared CI runner has been
     // observed to need far longer than the ~1.6s this takes locally.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     loop {
         let all_committed = object_states.iter().all(|state| {
             state
@@ -705,6 +705,244 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
         tasks.iter().all(|task| !task.is_finished()),
         "a validator's pipeline or coordinator task crashed under concurrent independent-sender load: {reported:?}"
     );
+
+    for task in tasks {
+        task.abort();
+    }
+}
+
+/// `KestrelCast` delivery is fire-and-forget, so a lost shred send strands the
+/// receiving validator's execution permanently: it holds the certified order
+/// and every transaction named in it, yet cannot rebuild the payload, because
+/// the leader's per-transaction base fees exist nowhere but the payload itself
+/// and are bound by the certified fee commitment (see TD-011).
+///
+/// Drops are deterministic in (sender, target, payload), so at this rate a
+/// validator reliably misses payloads from some peers while others still get
+/// through — exactly the case repair exists for, since a validator that did
+/// receive a payload can re-send it on request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[allow(clippy::too_many_lines)]
+async fn a_validator_that_missed_a_payload_recovers_it_from_peers() {
+    const TRANSACTION_COUNT: usize = 4;
+    let directory = TempDir::new().unwrap();
+    let senders = (0..TRANSACTION_COUNT)
+        .map(|index| {
+            let key = *Hash::digest(format!("repair-sender-{index}").as_bytes()).as_bytes();
+            let public_key = Ed25519Scheme.public_key(&key).unwrap();
+            let address = Ed25519Scheme.address(&public_key).unwrap();
+            let object = Object {
+                id: Hash::digest(format!("repair-object-{index}").as_bytes()),
+                owner: Owner::Single(address),
+                type_tag: "stage2::Object".to_owned(),
+                version: 0,
+                data: vec![0],
+                rent_balance: 1_000,
+            };
+            Sender {
+                key,
+                public_key,
+                address,
+                object,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let bls = Bls12381Scheme;
+    let mut bls_keys = Vec::new();
+    let mut libp2p_identities = Vec::new();
+    let mut validators = Vec::new();
+    let gossip_ports = (0..VALIDATOR_COUNT)
+        .map(|_| reserve_port())
+        .collect::<Vec<_>>();
+    for index in 1..=VALIDATOR_COUNT {
+        let key = vec![u8::try_from(index).unwrap(); 32];
+        let public_key = bls.public_key(&key).unwrap();
+        bls_keys.push(key.clone());
+        let gossip_identity = identity::Keypair::generate_ed25519();
+        let gossip_peer_id = gossip_identity.public().to_peer_id().to_string();
+        libp2p_identities.push(gossip_identity);
+        validators.push(GenesisValidator {
+            name: format!("validator-{index}"),
+            validator: Validator {
+                id: Hash::digest([u8::try_from(index).unwrap()]),
+                stake: 20,
+                public_key,
+                proof_of_possession: bls.proof_of_possession(&key).unwrap(),
+            },
+            network_address: reserve_socket_address(),
+            rpc_address: reserve_socket_address(),
+            gossip_peer_id,
+            gossip_address: format!("/ip4/127.0.0.1/tcp/{}", gossip_ports[index - 1]),
+        });
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let genesis = GenesisDocument {
+        format_version: GENESIS_FORMAT_VERSION,
+        chain_id: "kestrel-stage2-repair-test".to_owned(),
+        genesis_unix_ms: u64::try_from(now).unwrap() + 1_500,
+        blocks_per_epoch: 100,
+        state_config: StateConfig::default(),
+        active_signature_schemes: vec![1, 2],
+        equivocation_slash_basis_points: 5_000,
+        validators: validators.clone(),
+        initial_objects: senders.iter().map(|s| s.object.clone()).collect(),
+        initial_fee_balances: BTreeMap::new(),
+    };
+    let validated = genesis.validate().unwrap();
+    let peer_ids = libp2p_identities
+        .iter()
+        .map(identity::Keypair::public)
+        .map(|k| k.to_peer_id())
+        .collect::<Vec<_>>();
+    let validator_peers: BTreeMap<Hash, PeerId> = validators
+        .iter()
+        .zip(peer_ids.iter())
+        .map(|(entry, peer_id)| (entry.validator.id, *peer_id))
+        .collect();
+
+    let mut handles = Vec::new();
+    let mut object_states = Vec::new();
+    let mut tasks = Vec::new();
+    let mut built = Vec::new();
+    for index in 0..VALIDATOR_COUNT {
+        let status = Arc::new(RwLock::new(NodeStatus {
+            chain_id: genesis.chain_id.clone(),
+            genesis_hash: validated.genesis_hash,
+            finalized_height: 0,
+            committed_height: 0,
+            finalized_block: validated.genesis_hash,
+            state_root: validated.state_root,
+            peer_count: 0,
+            ready: false,
+            finality_latency_ms: None,
+            view_changes: 0,
+        }));
+        let shared_state = Arc::new(RwLock::new(StateTree::new(StateConfig::default()).unwrap()));
+        let lifecycle = BlockLifecycle::open(
+            &genesis,
+            directory.path().join(format!("app-{index}")),
+            Arc::clone(&status),
+            Arc::clone(&shared_state),
+            100,
+            4,
+        )
+        .unwrap();
+        let configured_peers = (0..VALIDATOR_COUNT)
+            .filter(|other| *other != index)
+            .map(|other| ConfiguredPeer {
+                peer_id: peer_ids[other],
+                address: format!("/ip4/127.0.0.1/tcp/{}", gossip_ports[other])
+                    .parse::<Multiaddr>()
+                    .unwrap(),
+            })
+            .collect();
+        let network_node = NetworkNode::spawn(
+            libp2p_identities[index].clone(),
+            GossipConfig {
+                listen_address: format!("/ip4/127.0.0.1/tcp/{}", gossip_ports[index])
+                    .parse()
+                    .unwrap(),
+                configured_peers,
+                heartbeat_interval: Duration::from_millis(25),
+                faults: network::NetworkFaults {
+                    // A transient outage, not a permanent one: deterministic
+                    // drops never reopen, so nothing that retries can recover
+                    // from them. This blackout stops any validator that is not
+                    // a height's proposer from receiving its payload, which is
+                    // precisely what repair has to undo.
+                    shred_outage: Duration::from_secs(3),
+                    ..network::NetworkFaults::default()
+                },
+                ..GossipConfig::default()
+            },
+        )
+        .unwrap();
+        let (finalized_order_sender, finalized_order_receiver) = mpsc::unbounded_channel();
+        let (pipeline, handle) = Stage2Pipeline::new(
+            &genesis,
+            network_node,
+            lifecycle,
+            validator_peers.clone(),
+            finalized_order_receiver,
+            Stage2PipelineConfig {
+                payload_repair_delay: Duration::from_millis(200),
+                ..Stage2PipelineConfig::default()
+            },
+        )
+        .unwrap();
+        let proposal_source = pipeline.proposal_source();
+        let coordinator = ConsensusCoordinator::bind_with_pipeline(
+            &genesis,
+            validators[index].validator.id,
+            bls_keys[index].clone(),
+            directory.path().join(format!("consensus-{index}")),
+            Arc::clone(&status),
+            CoordinatorConfig::default(),
+            CoordinatorFaults::default(),
+            proposal_source,
+            finalized_order_sender,
+        )
+        .await
+        .unwrap();
+        built.push((index, coordinator, pipeline));
+        handles.push(handle);
+        object_states.push(shared_state);
+    }
+    let genesis_time = genesis.genesis_unix_ms;
+    for (index, coordinator, pipeline) in built {
+        tasks.push(tokio::spawn(
+            async move {
+                let _ = coordinator.run(genesis_time).await;
+            }
+            .instrument(tracing::info_span!("validator", node = index)),
+        ));
+        tasks.push(tokio::spawn(
+            async move {
+                let _ = pipeline.run().await;
+            }
+            .instrument(tracing::info_span!("validator", node = index)),
+        ));
+    }
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for (index, sender) in senders.iter().enumerate() {
+        let transaction = signed_mutation(
+            &sender.key,
+            &sender.public_key,
+            sender.address,
+            0,
+            &sender.object,
+            0,
+            1,
+        );
+        handles[index % handles.len()]
+            .submit_transaction(transaction)
+            .unwrap();
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let all_committed = object_states.iter().all(|state| {
+            let state = state.read().unwrap();
+            senders.iter().all(|sender| {
+                state
+                    .object(&sender.object.id)
+                    .is_some_and(|o| o.data == vec![1])
+            })
+        });
+        if all_committed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a validator never recovered a payload it missed, so its execution stayed stuck"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     for task in tasks {
         task.abort();
@@ -1137,7 +1375,7 @@ async fn malformed_gossiped_transaction_does_not_kill_the_pipeline() {
     handles[0].submit_transaction(transaction).unwrap();
 
     // See the matching comment in the sibling test above for why 45s.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     loop {
         let all_committed = object_states.iter().all(|state| {
             state

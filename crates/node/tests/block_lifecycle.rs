@@ -462,7 +462,9 @@ fn signed_mutation_with_fee_bid(
 }
 
 fn wait_for_commit(lifecycle: &mut BlockLifecycle) -> node::DurableBlockRecord {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Upper bound on deferred execution committing, not an expectation: this is
+    // sub-second when idle. Tight bounds here fail on contended runners.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(record) = lifecycle.poll_commit().unwrap() {
             return record;

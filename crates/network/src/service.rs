@@ -43,7 +43,15 @@ pub struct NetworkFaults {
     pub transaction_drop_basis_points: u16,
     /// Fraction of this node's outbound shred sends dropped, in basis points
     /// (0..=10000). 10000 models a fully dead relay/leader shred path on it.
+    ///
+    /// Drops are deterministic in the message, so a blocked path never reopens.
+    /// That is the right model for a persistently dead relay, but it cannot
+    /// exercise anything that retries — use `shred_outage` for that.
     pub shred_drop_basis_points: u16,
+    /// Drops every outbound shred for this long after the node starts, then
+    /// delivers normally: a transient outage rather than a permanent one, which
+    /// is the case payload repair exists to recover from.
+    pub shred_outage: Duration,
 }
 
 /// Independent bandwidth/queue settings for transaction and shred propagation.
@@ -129,6 +137,7 @@ pub enum GossipError {
 pub struct NetworkHandle {
     transaction_sender: mpsc::Sender<Vec<u8>>,
     shred_sender: mpsc::Sender<(PeerId, Shred, bool)>,
+    repair_sender: mpsc::Sender<(PeerId, u64)>,
     ban_sender: mpsc::Sender<PeerId>,
     transaction_max_bytes: usize,
     shred_max_bytes: usize,
@@ -183,6 +192,24 @@ impl NetworkHandle {
             .map_err(|_| GossipError::ShredQueueUnavailable)
     }
 
+    /// Asks `peer` for the shreds of `height`, for a validator that has a
+    /// certified order it cannot execute because the payload never arrived.
+    ///
+    /// `KestrelCast` delivery is fire-and-forget, so a single lost send would
+    /// otherwise strand that validator's execution permanently: it holds the
+    /// order, and every transaction named in it, but cannot rebuild the payload
+    /// because the leader's per-transaction base fees exist nowhere else and are
+    /// bound by the certified fee commitment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the repair queue is full or the network task stopped.
+    pub fn try_request_payload(&self, peer: PeerId, height: u64) -> Result<(), GossipError> {
+        self.repair_sender
+            .try_send((peer, height))
+            .map_err(|_| GossipError::ShredQueueUnavailable)
+    }
+
     /// Blocks all present and future connections to and from `peer` and closes
     /// any connection to it immediately. Intended for a peer that has
     /// repeatedly sent invalid gossip; there is no automatic unban.
@@ -203,6 +230,10 @@ pub struct NetworkNode {
     pub handle: NetworkHandle,
     pub inbound_transactions: mpsc::Receiver<InboundTransaction>,
     pub inbound_shreds: mpsc::Receiver<InboundShred>,
+    /// `(peer, height)` pairs from peers that could not reconstruct that
+    /// height's payload. Answered by re-sending its shreds, which only the
+    /// pipeline can do because only it maps heights to payloads.
+    pub inbound_repair_requests: mpsc::Receiver<(PeerId, u64)>,
     pub task: JoinHandle<()>,
 }
 
@@ -244,12 +275,15 @@ impl NetworkNode {
             mpsc::channel(config.transaction_queue_capacity);
         let (shred_sender, shred_receiver) = mpsc::channel(config.shred_queue_capacity);
         let (ban_sender, ban_receiver) = mpsc::channel(64);
+        let (repair_sender, repair_receiver) = mpsc::channel(config.shred_queue_capacity);
+        let (inbound_repair_sender, inbound_repair_requests) = mpsc::channel(64);
         let (inbound_transaction_sender, inbound_transactions) =
             mpsc::channel(config.inbound_transaction_capacity);
         let (inbound_shred_sender, inbound_shreds) = mpsc::channel(config.inbound_shred_capacity);
         let handle = NetworkHandle {
             transaction_sender,
             shred_sender,
+            repair_sender,
             ban_sender,
             transaction_max_bytes: config.transaction_max_bytes,
             shred_max_bytes: config.shred_max_bytes,
@@ -259,8 +293,12 @@ impl NetworkNode {
             transaction_receiver,
             shred_receiver,
             ban_receiver,
-            inbound_transaction_sender,
-            inbound_shred_sender,
+            repair_receiver,
+            InboundSenders {
+                transactions: inbound_transaction_sender,
+                shreds: inbound_shred_sender,
+                repair_requests: inbound_repair_sender,
+            },
             RunConfig {
                 shred_max_bytes: config.shred_max_bytes,
                 faults: config.faults,
@@ -271,6 +309,7 @@ impl NetworkNode {
             handle,
             inbound_transactions,
             inbound_shreds,
+            inbound_repair_requests,
             task,
         })
     }
@@ -353,21 +392,35 @@ struct RunConfig {
     faults: NetworkFaults,
 }
 
+/// The loop's inbound publication points, grouped to keep `run` within bounds.
+struct InboundSenders {
+    transactions: mpsc::Sender<InboundTransaction>,
+    shreds: mpsc::Sender<InboundShred>,
+    repair_requests: mpsc::Sender<(PeerId, u64)>,
+}
+
+#[allow(clippy::too_many_lines)] // Keep the whole event loop visible in one place.
 async fn run(
     mut swarm: Swarm<Behaviour>,
     mut transaction_receiver: mpsc::Receiver<Vec<u8>>,
     mut shred_receiver: mpsc::Receiver<(PeerId, Shred, bool)>,
     mut ban_receiver: mpsc::Receiver<PeerId>,
-    inbound_transaction_sender: mpsc::Sender<InboundTransaction>,
-    inbound_shred_sender: mpsc::Sender<InboundShred>,
+    mut repair_receiver: mpsc::Receiver<(PeerId, u64)>,
+    inbound: InboundSenders,
     config: RunConfig,
 ) {
+    let InboundSenders {
+        transactions: inbound_transaction_sender,
+        shreds: inbound_shred_sender,
+        repair_requests: inbound_repair_sender,
+    } = inbound;
     let RunConfig {
         shred_max_bytes,
         faults,
     } = config;
     let transaction_topic = IdentTopic::new(TRANSACTION_TOPIC);
     let local_bytes = swarm.local_peer_id().to_bytes();
+    let started = std::time::Instant::now();
     loop {
         tokio::select! {
             Some(transaction) = transaction_receiver.recv() => {
@@ -383,10 +436,12 @@ async fn run(
                 let _ = swarm.behaviour_mut().transaction_gossip.publish(transaction_topic.clone(), transaction);
             }
             Some((peer, shred, relay_requested)) = shred_receiver.recv() => {
-                if deterministic_drop(
-                    faults.shred_drop_basis_points,
-                    &[&local_bytes, &peer.to_bytes(), &shred.payload],
-                ) {
+                if started.elapsed() < faults.shred_outage
+                    || deterministic_drop(
+                        faults.shred_drop_basis_points,
+                        &[&local_bytes, &peer.to_bytes(), &shred.payload],
+                    )
+                {
                     continue;
                 }
                 if !faults.outbound_delay.is_zero() {
@@ -394,8 +449,14 @@ async fn run(
                 }
                 swarm.behaviour_mut().shred_exchange.send_request(
                     &peer,
-                    ShredRequest { shred, relay_requested },
+                    ShredRequest::Deliver { shred, relay_requested },
                 );
+            }
+            Some((peer, height)) = repair_receiver.recv() => {
+                swarm
+                    .behaviour_mut()
+                    .shred_exchange
+                    .send_request(&peer, ShredRequest::RepairPayload { height });
             }
             Some(peer) = ban_receiver.recv() => {
                 swarm.behaviour_mut().block_list.block_peer(peer);
@@ -426,12 +487,22 @@ async fn run(
                         ..
                     }
                 )) => {
-                    if request.shred.payload.len() <= shred_max_bytes {
-                        let _ = inbound_shred_sender.try_send(InboundShred {
-                            source: peer,
-                            shred: request.shred,
-                            relay_requested: request.relay_requested,
-                        });
+                    match request {
+                        ShredRequest::Deliver { shred, relay_requested } => {
+                            if shred.payload.len() <= shred_max_bytes {
+                                let _ = inbound_shred_sender.try_send(InboundShred {
+                                    source: peer,
+                                    shred,
+                                    relay_requested,
+                                });
+                            }
+                        }
+                        // Only the pipeline maps heights to payloads, so the
+                        // request is handed up rather than answered here. Its
+                        // reply travels back over the ordinary shred path.
+                        ShredRequest::RepairPayload { height } => {
+                            let _ = inbound_repair_sender.try_send((peer, height));
+                        }
                     }
                     let _ = swarm.behaviour_mut().shred_exchange.send_response(channel, ShredResponse);
                 }
@@ -458,10 +529,17 @@ fn deterministic_drop(basis_points: u16, seed: &[&[u8]]) -> bool {
     sample < basis_points
 }
 
+/// A shred being delivered, or a request for the shreds of a height this peer
+/// could not reconstruct.
+///
+/// Repair is keyed by height rather than by block id: a validator that never
+/// received a payload cannot know its hash, since shreds are keyed by the hash
+/// of the payload itself. Height is the only identifier a stuck validator
+/// already has, from the certified order it is waiting to execute.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct ShredRequest {
-    shred: Shred,
-    relay_requested: bool,
+enum ShredRequest {
+    Deliver { shred: Shred, relay_requested: bool },
+    RepairPayload { height: u64 },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -483,14 +561,24 @@ mod tests {
         ConfiguredPeer, GossipConfig, GossipError, NetworkFaults, NetworkHandle, NetworkNode,
     };
 
+    /// Upper bound on a message crossing a loopback libp2p connection, which
+    /// takes milliseconds on an idle machine. Deliberately generous, because
+    /// the value only matters when the machine is not idle. The windows that
+    /// assert a message is *never* delivered stay short by design: a slow
+    /// machine only makes non-delivery more likely, so they cannot fail
+    /// spuriously the way a positive wait can.
+    const DELIVERY_BOUND: Duration = Duration::from_secs(15);
+
     #[test]
     fn full_shred_queue_does_not_block_transaction_queue() {
         let (transaction_sender, mut transaction_receiver) = mpsc::channel(1);
         let (shred_sender, _shred_receiver) = mpsc::channel(1);
         let (ban_sender, _ban_receiver) = mpsc::channel(1);
+        let (repair_sender, _repair_receiver) = mpsc::channel(1);
         let handle = NetworkHandle {
             transaction_sender,
             shred_sender,
+            repair_sender,
             ban_sender,
             transaction_max_bytes: 1024,
             shred_max_bytes: 1024,
@@ -518,9 +606,11 @@ mod tests {
         let (transaction_sender, _transaction_receiver) = mpsc::channel(1);
         let (shred_sender, mut shred_receiver) = mpsc::channel(1);
         let (ban_sender, _ban_receiver) = mpsc::channel(1);
+        let (repair_sender, _repair_receiver) = mpsc::channel(1);
         let handle = NetworkHandle {
             transaction_sender,
             shred_sender,
+            repair_sender,
             ban_sender,
             transaction_max_bytes: 1024,
             shred_max_bytes: 1024,
@@ -586,11 +676,10 @@ mod tests {
             .handle
             .try_publish_transaction(b"signed-transaction".to_vec())
             .unwrap();
-        let received =
-            tokio::time::timeout(Duration::from_secs(3), first.inbound_transactions.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let received = tokio::time::timeout(DELIVERY_BOUND, first.inbound_transactions.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(received.bytes, b"signed-transaction");
 
         let shred = Shred {
@@ -605,7 +694,7 @@ mod tests {
             .handle
             .try_send_shred(first_peer, shred.clone())
             .unwrap();
-        let received = tokio::time::timeout(Duration::from_secs(3), first.inbound_shreds.recv())
+        let received = tokio::time::timeout(DELIVERY_BOUND, first.inbound_shreds.recv())
             .await
             .unwrap()
             .unwrap();
@@ -652,11 +741,10 @@ mod tests {
             .handle
             .try_publish_transaction(b"before-ban".to_vec())
             .unwrap();
-        let received =
-            tokio::time::timeout(Duration::from_secs(3), first.inbound_transactions.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let received = tokio::time::timeout(DELIVERY_BOUND, first.inbound_transactions.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(received.bytes, b"before-ban");
 
         first.handle.ban_peer(second_peer).unwrap();
@@ -742,11 +830,10 @@ mod tests {
             .handle
             .try_publish_transaction(b"gossiped-transaction".to_vec())
             .unwrap();
-        let delivered =
-            tokio::time::timeout(Duration::from_secs(3), receiver.inbound_transactions.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let delivered = tokio::time::timeout(DELIVERY_BOUND, receiver.inbound_transactions.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(delivered.bytes, b"gossiped-transaction");
         receiver.task.abort();
         sender.task.abort();
@@ -783,11 +870,10 @@ mod tests {
             .handle
             .try_send_shred(receiver.local_peer_id, sample_shred())
             .unwrap();
-        let delivered =
-            tokio::time::timeout(Duration::from_secs(3), receiver.inbound_shreds.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let delivered = tokio::time::timeout(DELIVERY_BOUND, receiver.inbound_shreds.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(delivered.shred, sample_shred());
         receiver.task.abort();
         sender.task.abort();
@@ -827,11 +913,10 @@ mod tests {
             .handle
             .try_send_shred(receiver.local_peer_id, sample_shred())
             .unwrap();
-        let delivered =
-            tokio::time::timeout(Duration::from_secs(3), receiver.inbound_shreds.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let delivered = tokio::time::timeout(DELIVERY_BOUND, receiver.inbound_shreds.recv())
+            .await
+            .unwrap()
+            .unwrap();
         let elapsed = sent_at.elapsed();
         assert_eq!(delivered.shred, sample_shred());
         assert!(

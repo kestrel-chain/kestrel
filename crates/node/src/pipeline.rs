@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use consensus::FinalizedOrder;
@@ -52,6 +52,17 @@ pub struct Stage2PipelineConfig {
     /// whose RPC served stale data indefinitely. Exceeding the bound is a real
     /// local failure, so it is reported rather than absorbed silently.
     pub maximum_pending_orders: usize,
+    /// How long a validator waits for a certified height's payload to arrive on
+    /// its own before asking peers for it, and the cap on the doubling backoff
+    /// between repeated asks.
+    ///
+    /// `KestrelCast` delivery is fire-and-forget, so a single lost send strands
+    /// that validator's execution permanently without this: it holds the order
+    /// and every transaction named in it, yet cannot rebuild the payload,
+    /// because the leader's per-transaction base fees exist nowhere but the
+    /// payload and are bound by the certified fee commitment.
+    pub payload_repair_delay: Duration,
+    pub maximum_payload_repair_backoff: Duration,
 }
 
 impl Default for Stage2PipelineConfig {
@@ -71,6 +82,8 @@ impl Default for Stage2PipelineConfig {
             // execution by, and far below the hundreds seen when execution has
             // actually stopped.
             maximum_pending_orders: 64,
+            payload_repair_delay: Duration::from_millis(500),
+            maximum_payload_repair_backoff: Duration::from_secs(8),
         }
     }
 }
@@ -150,6 +163,11 @@ pub struct Stage2Pipeline {
     offense_counts: BTreeMap<PeerId, u32>,
     /// Shared node store used to persist peer bans so they survive a restart.
     store: Arc<RocksDbStore>,
+    inbound_repair_requests: mpsc::Receiver<(PeerId, u64)>,
+    /// When to next ask peers for the payload this validator is stuck on, and
+    /// the current backoff between asks. Cleared whenever a height is submitted.
+    repair_after: Option<Instant>,
+    repair_backoff: Duration,
 }
 
 impl Stage2Pipeline {
@@ -159,6 +177,7 @@ impl Stage2Pipeline {
     /// # Errors
     ///
     /// Rejects an incomplete/foreign peer topology or invalid mempool settings.
+    #[allow(clippy::too_many_lines)] // Keep the full component-wiring order auditable in one place.
     pub fn new(
         genesis: &GenesisDocument,
         network_node: NetworkNode,
@@ -172,6 +191,7 @@ impl Stage2Pipeline {
             || config.replication_factor == 0
             || config.maximum_inflight_shred_blocks == 0
             || config.maximum_pending_orders == 0
+            || config.payload_repair_delay.is_zero()
             || config.commit_poll_interval.is_zero()
         {
             return Err(PipelineError::InvalidConfiguration);
@@ -220,6 +240,7 @@ impl Stage2Pipeline {
                 payloads_reconstructed: 0,
                 shred_arrivals: BTreeMap::new(),
                 shred_sequence: 0,
+                recent_payloads: BTreeMap::new(),
             }),
             validator: TransactionValidator::from_genesis(genesis)?,
             network: network_node.handle.clone(),
@@ -271,6 +292,9 @@ impl Stage2Pipeline {
                 config,
                 offense_counts: BTreeMap::new(),
                 store: admission_store,
+                inbound_repair_requests: network_node.inbound_repair_requests,
+                repair_after: None,
+                repair_backoff: config.payload_repair_delay,
             },
             handle,
         ))
@@ -341,8 +365,16 @@ impl Stage2Pipeline {
                         });
                     }
                 }
+                Some((peer, height)) = self.inbound_repair_requests.recv() => {
+                    // Serving a peer is best-effort: not holding the payload is
+                    // normal, and a failure here must never be fatal.
+                    if let Err(error) = self.serve_payload_repair(peer, height) {
+                        debug!(%peer, height, %error, "could not serve a payload repair request");
+                    }
+                }
                 _ = ticker.tick() => {
                     self.submit_available_orders()?;
+                    self.request_payload_repair_if_stuck();
                     self.lifecycle.poll_commit()?;
                 }
                 else => return Err(PipelineError::PipelineClosed),
@@ -392,6 +424,64 @@ impl Stage2Pipeline {
         self.source.record_shred(inbound.shred)
     }
 
+    /// Re-sends a height's shreds to a peer that could not reconstruct it.
+    ///
+    /// Only this layer can answer: shreds are keyed by the hash of the payload,
+    /// which a validator that never received it cannot know, so repair is keyed
+    /// by height and resolved against the payloads held here.
+    fn serve_payload_repair(&self, peer: PeerId, height: u64) -> Result<(), PipelineError> {
+        let Some(payload) = self.source.payload_at_height(height)? else {
+            return Ok(());
+        };
+        for shred in payload.shreds(self.config.kestrel_cast)? {
+            // Deliberately the ordinary delivery path, so a repaired shred is
+            // validated, size-checked and fault-injected exactly like any other.
+            self.network.try_send_shred(peer, shred)?;
+        }
+        debug!(%peer, height, "served a payload repair request");
+        Ok(())
+    }
+
+    /// Asks peers for the payload this validator is stuck on, once it has
+    /// clearly not arrived by itself, then backs off so a genuinely
+    /// unavailable payload cannot generate unbounded traffic.
+    fn request_payload_repair_if_stuck(&mut self) {
+        let height = self.submitted_height.saturating_add(1);
+        if !self.pending_orders.contains_key(&height) {
+            // Nothing certified is waiting, so nothing is missing.
+            self.repair_after = None;
+            self.repair_backoff = self.config.payload_repair_delay;
+            return;
+        }
+        let now = Instant::now();
+        let Some(deadline) = self.repair_after else {
+            self.repair_after = Some(now + self.config.payload_repair_delay);
+            return;
+        };
+        if now < deadline {
+            return;
+        }
+        for peer in self
+            .peer_ids
+            .iter()
+            .copied()
+            .filter(|peer| *peer != self.local_peer_id)
+        {
+            if let Err(error) = self.network.try_request_payload(peer, height) {
+                debug!(%peer, height, %error, "could not queue a payload repair request");
+            }
+        }
+        warn!(
+            height,
+            "certified payload has not arrived; asking peers to resend it"
+        );
+        self.repair_backoff = self
+            .repair_backoff
+            .saturating_mul(2)
+            .min(self.config.maximum_payload_repair_backoff);
+        self.repair_after = Some(now + self.repair_backoff);
+    }
+
     fn submit_available_orders(&mut self) -> Result<(), PipelineError> {
         loop {
             let height = self.submitted_height.saturating_add(1);
@@ -419,6 +509,8 @@ impl Stage2Pipeline {
             // finalized-order path.
             self.source.note_submitted(&payload)?;
             self.submitted_height = height;
+            self.repair_after = None;
+            self.repair_backoff = self.config.payload_repair_delay;
         }
     }
 }
@@ -467,6 +559,11 @@ struct PipelineState {
     /// can be evicted when the buffer is full. See `evict_stale_shred_group`.
     shred_arrivals: BTreeMap<Hash, u64>,
     shred_sequence: u64,
+    /// Payloads for heights already submitted, kept solely to answer a peer's
+    /// repair request. `note_submitted` prunes `payloads` as soon as a height is
+    /// handed to execution, which would otherwise leave exactly the heights a
+    /// lagging validator needs unavailable from every peer that is keeping up.
+    recent_payloads: BTreeMap<u64, PropagatedBlock>,
 }
 
 /// Makes room for shreds belonging to `incoming` when the in-flight buffer is
@@ -536,6 +633,8 @@ struct PipelineProposalSource {
 
 const ADMISSION_KEY_PREFIX: &[u8] = b"pipeline/admission/pending/";
 const BAN_KEY_PREFIX: &[u8] = b"pipeline/ban/v1/";
+/// Executed heights whose payloads stay available to answer repair requests.
+const RETAINED_PAYLOADS_FOR_REPAIR: usize = 64;
 
 fn admission_key(id: Hash) -> Vec<u8> {
     let mut key = ADMISSION_KEY_PREFIX.to_vec();
@@ -795,6 +894,17 @@ impl PipelineProposalSource {
         Ok(())
     }
 
+    /// Any payload held for `height`, for answering a peer's repair request.
+    fn payload_at_height(&self, height: u64) -> Result<Option<PropagatedBlock>, PipelineError> {
+        let state = self.state.lock().map_err(|_| PipelineError::LockPoisoned)?;
+        Ok(state
+            .payloads
+            .iter()
+            .find(|((payload_height, _), _)| *payload_height == height)
+            .map(|(_, payload)| payload.clone())
+            .or_else(|| state.recent_payloads.get(&height).cloned()))
+    }
+
     fn payload_for_order(
         &self,
         order: &FinalizedOrder,
@@ -838,6 +948,16 @@ impl PipelineProposalSource {
         for id in ids {
             state.transactions.remove(&id);
             self.admission_store.delete(&admission_key(id))?;
+        }
+        state
+            .recent_payloads
+            .insert(payload.height, payload.clone());
+        // Bounded: only enough history for a lagging peer to catch up.
+        while state.recent_payloads.len() > RETAINED_PAYLOADS_FOR_REPAIR {
+            let oldest = state.recent_payloads.keys().next().copied();
+            if let Some(oldest) = oldest {
+                state.recent_payloads.remove(&oldest);
+            }
         }
         state
             .payloads
