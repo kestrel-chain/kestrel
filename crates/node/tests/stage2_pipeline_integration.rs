@@ -362,6 +362,7 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
     let mut object_states = Vec::new();
     let mut tasks = Vec::new();
     let mut statuses = Vec::new();
+    let mut built = Vec::new();
     let crashes: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     for index in 0..VALIDATOR_COUNT {
@@ -436,7 +437,21 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
         .await
         .unwrap();
 
-        let genesis_time = genesis.genesis_unix_ms;
+        built.push((index, coordinator, pipeline));
+        handles.push(handle);
+        object_states.push(shared_state);
+        statuses.push(status);
+    }
+
+    // Start every validator together, only once all of them are constructed.
+    // Spawning inside the loop above let the first validator begin consensus
+    // while the last was still opening RocksDB and binding sockets. On a slow
+    // machine that stagger pushes later validators past genesis time, and a
+    // validator that joins behind can never catch up -- Replica::advance_view
+    // accepts a certificate only for its own current height and view -- so it
+    // is stranded permanently, and enough stranded validators wedge the chain.
+    let genesis_time = genesis.genesis_unix_ms;
+    for (index, coordinator, pipeline) in built {
         // Capture *why* a task ended. Without this the assertion below can only
         // report "something crashed", which is useless on a CI runner where the
         // race reproduces but the machine isn't available to debug.
@@ -460,10 +475,6 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
                 );
             }
         }));
-
-        handles.push(handle);
-        object_states.push(shared_state);
-        statuses.push(status);
     }
 
     // Let the gossip mesh dial and stabilize before genesis time arrives.
