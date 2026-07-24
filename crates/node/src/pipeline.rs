@@ -200,6 +200,8 @@ impl Stage2Pipeline {
                 retired_height: lifecycle.committed_height(),
                 shreds_received: 0,
                 payloads_reconstructed: 0,
+                shred_arrivals: BTreeMap::new(),
+                shred_sequence: 0,
             }),
             validator: TransactionValidator::from_genesis(genesis)?,
             network: network_node.handle.clone(),
@@ -418,6 +420,45 @@ struct PipelineState {
     /// never complete a block".
     shreds_received: u64,
     payloads_reconstructed: u64,
+    /// Monotonic arrival order of each in-flight shred group, so the stalest
+    /// can be evicted when the buffer is full. See `evict_stale_shred_group`.
+    shred_arrivals: BTreeMap<Hash, u64>,
+    shred_sequence: u64,
+}
+
+/// Makes room for shreds belonging to `incoming` when the in-flight buffer is
+/// full, by dropping the group that was last updated longest ago.
+///
+/// A group is otherwise only removed once it completes, and plenty never do:
+/// a validator receives shreds for blocks it does not need and partial sets it
+/// can never finish. Those accumulate until the buffer is permanently full, and
+/// from then on every shred for a *new* block is refused — so the validator can
+/// never reconstruct another payload and its execution stops for good while
+/// consensus keeps ordering ahead of it. Evicting the stalest group instead
+/// keeps the memory bound while preserving liveness: the newest block is the
+/// one execution is most likely waiting on.
+///
+/// Returns whether room is now available for `incoming`.
+fn evict_stale_shred_group(
+    shreds: &mut BTreeMap<Hash, BTreeMap<u16, Shred>>,
+    arrivals: &mut BTreeMap<Hash, u64>,
+    capacity: usize,
+    incoming: Hash,
+) -> bool {
+    if shreds.contains_key(&incoming) || shreds.len() < capacity {
+        return true;
+    }
+    let stalest = arrivals
+        .iter()
+        .filter(|(block_id, _)| **block_id != incoming)
+        .min_by_key(|(_, arrival)| **arrival)
+        .map(|(block_id, _)| *block_id);
+    if let Some(stalest) = stalest {
+        shreds.remove(&stalest);
+        arrivals.remove(&stalest);
+        return true;
+    }
+    false
 }
 
 /// Observability for the shred/payload path, which decides whether a validator
@@ -663,13 +704,19 @@ impl PipelineProposalSource {
         let block_id = shred.block_id;
         let data_shards = usize::from(shred.data_shards);
         let candidate = {
-            let mut state = self.state.lock().map_err(|_| PipelineError::LockPoisoned)?;
+            let mut guard = self.state.lock().map_err(|_| PipelineError::LockPoisoned)?;
+            let state = &mut *guard;
             state.shreds_received = state.shreds_received.saturating_add(1);
-            if !state.shreds.contains_key(&block_id)
-                && state.shreds.len() >= self.config.maximum_inflight_shred_blocks
-            {
+            if !evict_stale_shred_group(
+                &mut state.shreds,
+                &mut state.shred_arrivals,
+                self.config.maximum_inflight_shred_blocks,
+                block_id,
+            ) {
                 return Err(PipelineError::InflightShredLimitReached);
             }
+            state.shred_sequence = state.shred_sequence.saturating_add(1);
+            state.shred_arrivals.insert(block_id, state.shred_sequence);
             let shreds = state.shreds.entry(block_id).or_default();
             shreds.entry(shred.index).or_insert(shred);
             (shreds.len() >= data_shards).then(|| shreds.values().cloned().collect::<Vec<_>>())
@@ -688,6 +735,7 @@ impl PipelineProposalSource {
             .entry((payload.height, payload.parent_id))
             .or_insert(payload);
         state.shreds.remove(&block_id);
+        state.shred_arrivals.remove(&block_id);
         Ok(())
     }
 
@@ -847,6 +895,50 @@ mod tests {
         BAN_KEY_PREFIX, PipelineError, is_peer_misbehaviour, persist_ban, persisted_bans,
         tally_offense,
     };
+
+    #[test]
+    fn a_full_shred_buffer_evicts_the_stalest_group_instead_of_wedging() {
+        use std::collections::BTreeMap;
+        use types::Hash;
+        let capacity = 4;
+        let mut shreds: BTreeMap<Hash, BTreeMap<u16, super::Shred>> = BTreeMap::new();
+        let mut arrivals: BTreeMap<Hash, u64> = BTreeMap::new();
+
+        // Fill the buffer with groups that will never complete, which is what
+        // happens in practice: a validator receives shreds for blocks it does
+        // not need, and partial sets it can never finish.
+        for index in 0..capacity {
+            let block = Hash::digest([u8::try_from(index).unwrap()]);
+            shreds.insert(block, BTreeMap::new());
+            arrivals.insert(block, index as u64);
+        }
+        assert_eq!(shreds.len(), capacity);
+
+        // A shred for a new block must still be accepted. Before this, it was
+        // refused outright, so once the buffer filled with stuck groups the
+        // validator could never reconstruct another payload and its execution
+        // stopped permanently while consensus kept ordering ahead of it.
+        let wanted = Hash::digest(b"the block execution is waiting for");
+        assert!(super::evict_stale_shred_group(
+            &mut shreds,
+            &mut arrivals,
+            capacity,
+            wanted
+        ));
+        // The stalest group made way, and the bound still holds.
+        assert!(!shreds.contains_key(&Hash::digest([0_u8])));
+        assert_eq!(shreds.len(), capacity - 1);
+
+        // An in-flight group is never evicted to make room for itself.
+        let existing = Hash::digest([1_u8]);
+        assert!(super::evict_stale_shred_group(
+            &mut shreds,
+            &mut arrivals,
+            capacity,
+            existing
+        ));
+        assert!(shreds.contains_key(&existing));
+    }
 
     #[test]
     fn routine_gossip_races_are_not_counted_as_peer_offenses() {
