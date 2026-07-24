@@ -82,6 +82,25 @@ impl Stage2PipelineHandle {
         }
         Ok(id)
     }
+
+    /// Snapshot of this validator's shred/payload path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the pipeline state mutex is poisoned.
+    pub fn shred_stats(&self) -> Result<ShredStats, PipelineError> {
+        let state = self
+            .source
+            .state
+            .lock()
+            .map_err(|_| PipelineError::LockPoisoned)?;
+        Ok(ShredStats {
+            shreds_received: state.shreds_received,
+            payloads_reconstructed: state.payloads_reconstructed,
+            payloads_available: state.payloads.len(),
+            incomplete_shred_blocks: state.shreds.len(),
+        })
+    }
 }
 
 impl rpc::TransactionSubmitter for Stage2PipelineHandle {
@@ -179,6 +198,8 @@ impl Stage2Pipeline {
                 shreds: BTreeMap::new(),
                 propagated: BTreeSet::new(),
                 retired_height: lifecycle.committed_height(),
+                shreds_received: 0,
+                payloads_reconstructed: 0,
             }),
             validator: TransactionValidator::from_genesis(genesis)?,
             network: network_node.handle.clone(),
@@ -390,6 +411,29 @@ struct PipelineState {
     /// transactions out) could race ahead and re-select an already-certified
     /// transaction into a later height it does lead.
     retired_height: u64,
+    /// Inbound shreds accepted from the network, and payloads successfully
+    /// reconstructed from them. A validator that did not propose a block can
+    /// only execute that height once its payload arrives this way, so these
+    /// separate "no shreds are reaching me at all" from "shreds arrive but
+    /// never complete a block".
+    shreds_received: u64,
+    payloads_reconstructed: u64,
+}
+
+/// Observability for the shred/payload path, which decides whether a validator
+/// can execute a height it did not propose itself. Without a payload the
+/// pipeline retries that height indefinitely and executes nothing, while
+/// consensus keeps ordering — so these counters are what distinguish a
+/// delivery failure from a reconstruction failure.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ShredStats {
+    pub shreds_received: u64,
+    pub payloads_reconstructed: u64,
+    /// Payloads available to match against a finalized order, whether
+    /// reconstructed from shreds or built locally as proposer.
+    pub payloads_available: usize,
+    /// Blocks holding some shreds but not yet enough to reconstruct.
+    pub incomplete_shred_blocks: usize,
 }
 
 struct PipelineProposalSource {
@@ -620,6 +664,7 @@ impl PipelineProposalSource {
         let data_shards = usize::from(shred.data_shards);
         let candidate = {
             let mut state = self.state.lock().map_err(|_| PipelineError::LockPoisoned)?;
+            state.shreds_received = state.shreds_received.saturating_add(1);
             if !state.shreds.contains_key(&block_id)
                 && state.shreds.len() >= self.config.maximum_inflight_shred_blocks
             {
@@ -637,6 +682,7 @@ impl PipelineProposalSource {
             self.validator.validate(transaction)?;
         }
         let mut state = self.state.lock().map_err(|_| PipelineError::LockPoisoned)?;
+        state.payloads_reconstructed = state.payloads_reconstructed.saturating_add(1);
         state
             .payloads
             .entry((payload.height, payload.parent_id))

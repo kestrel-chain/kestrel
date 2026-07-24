@@ -535,10 +535,12 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
             let progress = statuses
                 .iter()
                 .zip(object_states.iter())
+                .zip(handles.iter())
                 .enumerate()
-                .map(|(node, (status, state))| {
+                .map(|(node, ((status, state), handle))| {
                     let status = status.read().unwrap();
                     let state = state.read().unwrap();
+                    let shreds = handle.shred_stats().unwrap();
                     let committed = senders
                         .iter()
                         .filter(|sender| {
@@ -553,17 +555,28 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
                     // the same certified order into different state, which
                     // deferred execution cannot catch on its own because state
                     // roots never feed back into the ordering vote.
+                    // A validator that did not propose a block can only execute
+                    // that height once its payload arrives as shreds. If
+                    // execution is stuck while ordering runs away, these
+                    // counters say whether shreds never arrived at all or
+                    // arrived without ever completing a block.
                     format!(
                         "node {node}: ordered_height={} executed_height={} \
-                         (execution trails ordering by {}) state_root={} applied={}/{}",
+                         (execution trails ordering by {}) applied={}/{} \
+                         shreds_received={} payloads_reconstructed={} \
+                         payloads_available={} incomplete_shred_blocks={} state_root={}",
                         status.finalized_height,
                         status.committed_height,
                         status
                             .finalized_height
                             .saturating_sub(status.committed_height),
-                        status.state_root,
                         committed,
-                        senders.len()
+                        senders.len(),
+                        shreds.shreds_received,
+                        shreds.payloads_reconstructed,
+                        shreds.payloads_available,
+                        shreds.incomplete_shred_blocks,
+                        status.state_root,
                     )
                 })
                 .collect::<Vec<_>>();

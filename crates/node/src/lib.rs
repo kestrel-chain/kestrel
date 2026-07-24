@@ -25,7 +25,9 @@ pub use lifecycle::{
     BlockLifecycle, DurableBlockRecord, LifecycleError, PropagatedBlock, SignedExecutionPayload,
     TransactionValidator, signed_transaction_id,
 };
-pub use pipeline::{PipelineError, Stage2Pipeline, Stage2PipelineConfig, Stage2PipelineHandle};
+pub use pipeline::{
+    PipelineError, ShredStats, Stage2Pipeline, Stage2PipelineConfig, Stage2PipelineHandle,
+};
 
 pub const GENESIS_FORMAT_VERSION: u16 = 1;
 pub const MIN_VALIDATORS: usize = 4;
