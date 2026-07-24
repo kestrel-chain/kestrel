@@ -534,15 +534,16 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
                                 .is_some_and(|object| object.data == vec![1])
                         })
                         .count();
-                    // `view_changes` is the view of the last *finalized* block,
-                    // not a live view counter, so it stays 0 while nothing has
-                    // committed. `height` is the real signal: 0 across every
-                    // node means a genuine stall, a rising height means the
-                    // chain is merely slow.
+                    // `height` distinguishes a stall from mere slowness, and
+                    // `state_root` distinguishes slowness from divergence: the
+                    // same height with differing roots means nodes executed
+                    // the same certified order into different state, which
+                    // deferred execution cannot catch on its own because state
+                    // roots never feed back into the ordering vote.
                     format!(
-                        "node {node}: height={} last_finalized_view={} committed={}/{}",
+                        "node {node}: height={} state_root={} committed={}/{}",
                         status.finalized_height,
-                        status.view_changes,
+                        status.state_root,
                         committed,
                         senders.len()
                     )
