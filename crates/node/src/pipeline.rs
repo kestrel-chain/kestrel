@@ -259,7 +259,9 @@ impl Stage2Pipeline {
                 Some(transaction) = self.inbound_transactions.recv() => {
                     if let Err(error) = self.handle_inbound_transaction(&transaction.bytes) {
                         debug!(%error, "rejected inbound gossiped transaction");
-                        if let Some(peer) = transaction.source {
+                        if let Some(peer) = transaction.source
+                            && is_peer_misbehaviour(&error)
+                        {
                             self.record_offense(peer);
                         }
                     }
@@ -270,7 +272,9 @@ impl Stage2Pipeline {
                         Ok(()) => self.submit_available_orders()?,
                         Err(error) => {
                             debug!(%error, "rejected inbound shred");
-                            self.record_offense(source);
+                            if is_peer_misbehaviour(&error) {
+                                self.record_offense(source);
+                            }
                         }
                     }
                 }
@@ -757,6 +761,34 @@ fn tally_offense(offense_counts: &mut BTreeMap<PeerId, u32>, peer: PeerId) -> u3
     *count
 }
 
+/// Whether a rejected inbound message should count against the peer that sent
+/// it. Only failures an honest peer cannot legitimately produce are counted.
+///
+/// This distinction is load-bearing, not cosmetic. Re-gossiping a transaction
+/// that has since been committed is *normal* behaviour — the sender's nonce has
+/// simply moved on — and so is racing two copies of the same sender's
+/// transaction, or hitting a full mempool scope. Counting those as offenses
+/// meant honest validators accumulated offenses against each other purely from
+/// ordinary concurrent gossip and, at the default threshold of 8, permanently
+/// banned one another: a self-inflicted network partition under load, made
+/// worse now that bans survive restarts. Genuine misbehaviour a peer *is*
+/// accountable for — undecodable bytes, a bad signature, an invalid shred —
+/// still counts, so the denial-of-service protection from TD-025 is unchanged.
+fn is_peer_misbehaviour(error: &PipelineError) -> bool {
+    !matches!(
+        error,
+        // Ordinary races between commit and in-flight gossip.
+        PipelineError::NonceMismatch { .. }
+            | PipelineError::SenderAlreadyReserved(_)
+            // Local congestion/limits, not the sender's doing.
+            | PipelineError::Mempool(_)
+            | PipelineError::InflightShredLimitReached
+            // Our own internal faults are never the peer's fault.
+            | PipelineError::LockPoisoned
+            | PipelineError::Storage(_)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -765,7 +797,35 @@ mod tests {
     use storage::{KvStore, RocksDbStore};
     use tempfile::TempDir;
 
-    use super::{BAN_KEY_PREFIX, persist_ban, persisted_bans, tally_offense};
+    use super::{
+        BAN_KEY_PREFIX, PipelineError, is_peer_misbehaviour, persist_ban, persisted_bans,
+        tally_offense,
+    };
+
+    #[test]
+    fn routine_gossip_races_are_not_counted_as_peer_offenses() {
+        // An honest validator re-gossiping a transaction that has since
+        // committed produces exactly this, and must never be banned for it.
+        assert!(!is_peer_misbehaviour(&PipelineError::NonceMismatch {
+            expected: 1,
+            received: 0,
+        }));
+        assert!(!is_peer_misbehaviour(
+            &PipelineError::SenderAlreadyReserved(types::Address::from_bytes([7; 32]))
+        ));
+        // Local congestion and our own internal faults are not the peer's doing.
+        assert!(!is_peer_misbehaviour(
+            &PipelineError::InflightShredLimitReached
+        ));
+        assert!(!is_peer_misbehaviour(&PipelineError::LockPoisoned));
+
+        // Genuine misbehaviour a peer is accountable for still counts, so the
+        // TD-025 denial-of-service protection is unchanged.
+        assert!(is_peer_misbehaviour(&PipelineError::Encoding(
+            "malformed bytes".to_owned()
+        )));
+        assert!(is_peer_misbehaviour(&PipelineError::NonceOverflow));
+    }
 
     #[test]
     fn persisted_bans_survive_a_store_reopen_and_tolerate_corrupt_entries() {

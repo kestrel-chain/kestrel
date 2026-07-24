@@ -352,6 +352,7 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
     let mut handles = Vec::new();
     let mut object_states = Vec::new();
     let mut tasks = Vec::new();
+    let crashes: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     for index in 0..VALIDATOR_COUNT {
         let status = Arc::new(RwLock::new(NodeStatus {
@@ -426,11 +427,30 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
         .unwrap();
 
         let genesis_time = genesis.genesis_unix_ms;
+        // Capture *why* a task ended. Without this the assertion below can only
+        // report "something crashed", which is useless on a CI runner where the
+        // race reproduces but the machine isn't available to debug.
+        let coordinator_crashes = Arc::clone(&crashes);
         tasks.push(tokio::spawn(async move {
-            let _ = coordinator.run(genesis_time).await;
+            match coordinator.run(genesis_time).await {
+                Ok(outcome) => coordinator_crashes.lock().unwrap().push(format!(
+                    "validator {index} coordinator exited unexpectedly at height {}",
+                    outcome.finalized_height
+                )),
+                Err(error) => coordinator_crashes
+                    .lock()
+                    .unwrap()
+                    .push(format!("validator {index} coordinator failed: {error}")),
+            }
         }));
+        let pipeline_crashes = Arc::clone(&crashes);
         tasks.push(tokio::spawn(async move {
-            let _ = pipeline.run().await;
+            if let Err(error) = pipeline.run().await {
+                pipeline_crashes
+                    .lock()
+                    .unwrap()
+                    .push(format!("validator {index} pipeline failed: {error}"));
+            }
         }));
 
         handles.push(handle);
@@ -470,7 +490,8 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
         }
         assert!(
             tasks.iter().all(|task| !task.is_finished()),
-            "a validator's pipeline or coordinator task crashed under concurrent independent-sender load"
+            "a validator's pipeline or coordinator task crashed under concurrent independent-sender load: {:?}",
+            crashes.lock().unwrap()
         );
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -480,7 +501,8 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
     }
     assert!(
         tasks.iter().all(|task| !task.is_finished()),
-        "a validator's pipeline or coordinator task crashed under concurrent independent-sender load"
+        "a validator's pipeline or coordinator task crashed under concurrent independent-sender load: {:?}",
+        crashes.lock().unwrap()
     );
 
     for task in tasks {
