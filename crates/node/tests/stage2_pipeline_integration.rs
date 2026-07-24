@@ -135,6 +135,7 @@ async fn stage2_pipeline_commits_a_gossiped_transaction_across_all_nodes() {
             chain_id: genesis.chain_id.clone(),
             genesis_hash: validated.genesis_hash,
             finalized_height: 0,
+            committed_height: 0,
             finalized_block: validated.genesis_hash,
             state_root: validated.state_root,
             peer_count: 0,
@@ -370,6 +371,7 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
             chain_id: genesis.chain_id.clone(),
             genesis_hash: validated.genesis_hash,
             finalized_height: 0,
+            committed_height: 0,
             finalized_block: validated.genesis_hash,
             state_root: validated.state_root,
             peer_count: 0,
@@ -552,8 +554,13 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
                     // deferred execution cannot catch on its own because state
                     // roots never feed back into the ordering vote.
                     format!(
-                        "node {node}: height={} state_root={} committed={}/{}",
+                        "node {node}: ordered_height={} executed_height={} \
+                         (execution trails ordering by {}) state_root={} applied={}/{}",
                         status.finalized_height,
+                        status.committed_height,
+                        status
+                            .finalized_height
+                            .saturating_sub(status.committed_height),
                         status.state_root,
                         committed,
                         senders.len()
@@ -670,6 +677,7 @@ async fn malformed_gossiped_transaction_does_not_kill_the_pipeline() {
             chain_id: genesis.chain_id.clone(),
             genesis_hash: validated.genesis_hash,
             finalized_height: 0,
+            committed_height: 0,
             finalized_block: validated.genesis_hash,
             state_root: validated.state_root,
             peer_count: 0,
@@ -908,6 +916,7 @@ async fn admitted_transaction_survives_a_restart_before_finalization() {
             chain_id: genesis.chain_id.clone(),
             genesis_hash: validated.genesis_hash,
             finalized_height: 0,
+            committed_height: 0,
             finalized_block: validated.genesis_hash,
             state_root: validated.state_root,
             peer_count: 0,
@@ -959,6 +968,7 @@ async fn admitted_transaction_survives_a_restart_before_finalization() {
         chain_id: genesis.chain_id.clone(),
         genesis_hash: validated.genesis_hash,
         finalized_height: 0,
+        committed_height: 0,
         finalized_block: validated.genesis_hash,
         state_root: validated.state_root,
         peer_count: 0,

@@ -601,7 +601,14 @@ impl BlockLifecycle {
                 .status
                 .write()
                 .map_err(|_| LifecycleError::LockPoisoned)?;
-            status.finalized_height = record.height;
+            // `committed_height` is this component's own clock: the height it
+            // has executed and durably written, which `state_root` belongs to.
+            // `finalized_height` is also advanced here so a node that is not
+            // running a coordinator (or has not finalized anything yet) still
+            // reports a sensible ordering position, but the coordinator owns it
+            // once consensus is running and will be ahead of this.
+            status.committed_height = record.height;
+            status.finalized_height = status.finalized_height.max(record.height);
             status.finalized_block = record.consensus_block_id;
             status.state_root = record.state_root;
             status.ready = true;

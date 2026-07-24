@@ -618,6 +618,7 @@ fn status(
         chain_id: genesis.chain_id.clone(),
         genesis_hash,
         finalized_height: 0,
+        committed_height: 0,
         finalized_block: genesis_hash,
         state_root,
         peer_count: 0,

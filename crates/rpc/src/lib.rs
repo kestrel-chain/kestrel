@@ -73,8 +73,21 @@ impl RpcConfig {
 pub struct NodeStatus {
     pub chain_id: String,
     pub genesis_hash: Hash,
+    /// Highest height consensus has *ordered*, published by the coordinator as
+    /// soon as a certificate forms. Because execution is deferred, this runs
+    /// ahead of what the node has actually executed — see `committed_height`.
     pub finalized_height: u64,
     pub finalized_block: Hash,
+    /// Highest height this node has executed and durably committed, published
+    /// by the block lifecycle. `state_root` is the root *at this height*, not
+    /// at `finalized_height`.
+    ///
+    /// Kept distinct because the two clocks are genuinely different: comparing
+    /// a `state_root` against `finalized_height` compares an execution result
+    /// to a consensus position and makes normal deferred-execution lag look
+    /// like nodes disagreeing about state. The gap between the two is also the
+    /// direct measure of how far execution trails ordering.
+    pub committed_height: u64,
     pub state_root: Hash,
     pub peer_count: usize,
     pub ready: bool,
@@ -632,6 +645,7 @@ mod tests {
             chain_id: "kestrel-testnet-1".to_owned(),
             genesis_hash: Hash::digest(b"genesis"),
             finalized_height: 7,
+            committed_height: 7,
             finalized_block: Hash::digest(b"block"),
             state_root: state.root().unwrap(),
             peer_count: 3,
