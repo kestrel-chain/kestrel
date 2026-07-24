@@ -399,6 +399,13 @@ struct PipelineState {
     reserved_senders: BTreeMap<Address, Hash>,
     next_nonces: BTreeMap<Address, u64>,
     arrival_sequence: u64,
+    /// Candidate payloads for heights not yet submitted, keyed by height plus a
+    /// discriminator: this validator's own proposals use the parent id, so a
+    /// re-proposal of the same height and parent is deterministic, while
+    /// payloads reconstructed from shreds use their own payload id, so
+    /// competing proposals for one height each keep a slot instead of
+    /// overwriting each other. `payload_for_order` picks whichever one the
+    /// certified order actually names; `note_submitted` prunes by height.
     payloads: BTreeMap<(u64, Hash), PropagatedBlock>,
     shreds: BTreeMap<Hash, BTreeMap<u16, Shred>>,
     propagated: BTreeSet<(u64, Hash)>,
@@ -728,11 +735,22 @@ impl PipelineProposalSource {
         for transaction in &payload.transactions {
             self.validator.validate(transaction)?;
         }
+        // Key a reconstructed payload by its own identity, not by its parent.
+        // Different leaders in different views propose *different* payloads for
+        // the same (height, parent_id), so keying on the parent collapses them
+        // onto one slot: whichever arrived first won it permanently, and
+        // `or_insert` silently discarded the rest. A validator that reconstructed
+        // a losing proposal first then held a payload whose transaction IDs could
+        // never match the certified order, so `payload_for_order` returned None
+        // for that height forever and its execution stopped there for good while
+        // consensus kept ordering ahead of it. Keying by payload identity keeps
+        // every candidate, and the height-based pruning below still bounds them.
+        let payload_key = payload.payload_id()?;
         let mut state = self.state.lock().map_err(|_| PipelineError::LockPoisoned)?;
         state.payloads_reconstructed = state.payloads_reconstructed.saturating_add(1);
         state
             .payloads
-            .entry((payload.height, payload.parent_id))
+            .entry((payload.height, payload_key))
             .or_insert(payload);
         state.shreds.remove(&block_id);
         state.shred_arrivals.remove(&block_id);
