@@ -36,6 +36,15 @@ use types::{Address, Hash, Object, Owner, Transaction};
 
 const VALIDATOR_COUNT: usize = 4;
 
+/// Records why a validator task ended, tolerating a poisoned mutex so one
+/// panicking task cannot bury the original failure behind `PoisonError`.
+fn record_crash(crashes: &Arc<std::sync::Mutex<Vec<String>>>, reason: String) {
+    match crashes.lock() {
+        Ok(mut guard) => guard.push(reason),
+        Err(poisoned) => poisoned.into_inner().push(reason),
+    }
+}
+
 struct Sender {
     key: [u8; 32],
     public_key: Vec<u8>,
@@ -432,24 +441,22 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
         // race reproduces but the machine isn't available to debug.
         let coordinator_crashes = Arc::clone(&crashes);
         tasks.push(tokio::spawn(async move {
-            match coordinator.run(genesis_time).await {
-                Ok(outcome) => coordinator_crashes.lock().unwrap().push(format!(
+            let reason = match coordinator.run(genesis_time).await {
+                Ok(outcome) => format!(
                     "validator {index} coordinator exited unexpectedly at height {}",
                     outcome.finalized_height
-                )),
-                Err(error) => coordinator_crashes
-                    .lock()
-                    .unwrap()
-                    .push(format!("validator {index} coordinator failed: {error}")),
-            }
+                ),
+                Err(error) => format!("validator {index} coordinator failed: {error}"),
+            };
+            record_crash(&coordinator_crashes, reason);
         }));
         let pipeline_crashes = Arc::clone(&crashes);
         tasks.push(tokio::spawn(async move {
             if let Err(error) = pipeline.run().await {
-                pipeline_crashes
-                    .lock()
-                    .unwrap()
-                    .push(format!("validator {index} pipeline failed: {error}"));
+                record_crash(
+                    &pipeline_crashes,
+                    format!("validator {index} pipeline failed: {error}"),
+                );
             }
         }));
 
@@ -488,10 +495,16 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
         if all_committed {
             break;
         }
+        // Snapshot rather than holding the guard across the assert: panicking
+        // while holding it poisons the mutex, which then panics every still-
+        // running task and buries the real error under PoisonError noise.
+        let reported = crashes.lock().map_or_else(
+            |poisoned| poisoned.into_inner().clone(),
+            |guard| guard.clone(),
+        );
         assert!(
             tasks.iter().all(|task| !task.is_finished()),
-            "a validator's pipeline or coordinator task crashed under concurrent independent-sender load: {:?}",
-            crashes.lock().unwrap()
+            "a validator's pipeline or coordinator task crashed under concurrent independent-sender load: {reported:?}"
         );
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -499,10 +512,13 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    let reported = crashes.lock().map_or_else(
+        |poisoned| poisoned.into_inner().clone(),
+        |guard| guard.clone(),
+    );
     assert!(
         tasks.iter().all(|task| !task.is_finished()),
-        "a validator's pipeline or coordinator task crashed under concurrent independent-sender load: {:?}",
-        crashes.lock().unwrap()
+        "a validator's pipeline or coordinator task crashed under concurrent independent-sender load: {reported:?}"
     );
 
     for task in tasks {

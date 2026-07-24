@@ -7,8 +7,9 @@ use std::{
 };
 
 use consensus::{
-    CertificateKind, FinalizedOrder, Proposal, QuorumCertificate, Replica, ReplicaSnapshot,
-    SignedProposal, ValidatorSet, Vote, VoteCollector, VotePhase, verify_certificate,
+    CertificateKind, ConsensusError, FinalizedOrder, Proposal, QuorumCertificate, Replica,
+    ReplicaSnapshot, SignedProposal, ValidatorSet, Vote, VoteCollector, VotePhase,
+    verify_certificate,
 };
 use crypto::{AggregateSignatureScheme, Bls12381Scheme};
 use rpc::NodeStatus;
@@ -21,9 +22,30 @@ use tokio::{
     sync::mpsc,
     time::{MissedTickBehavior, interval, sleep, timeout},
 };
+use tracing::debug;
 use types::Hash;
 
 use crate::{GenesisDocument, GenesisError};
+
+/// Reclassifies an honest replica's refusal to cast both first-round votes in
+/// one view as "skip this vote", not a local fault.
+///
+/// A replica that has already cast this view's timeout vote must not also cast
+/// an order vote for it — that mutual exclusion is the TD-022 safety rule and
+/// is working as intended. But under a slow round it is an ordinary race: the
+/// round timed out, and only then did a delayed proposal arrive. Propagating
+/// the refusal killed the whole coordinator task, so a validator that merely
+/// ran slowly took itself off the network instead of waiting for the timeout
+/// certificate to advance the view. Every other consensus failure stays fatal.
+fn skip_when_view_already_timed_out(
+    result: Result<Vote, ConsensusError>,
+) -> Result<Option<Vote>, ConsensusError> {
+    match result {
+        Ok(vote) => Ok(Some(vote)),
+        Err(ConsensusError::ConflictingFirstRoundVote) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
 
 const SAFETY_STATE_KEY: &[u8] = b"consensus/replica-snapshot/v1";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -395,10 +417,18 @@ impl ConsensusCoordinator {
                     &self.private_key,
                     self.scheme.as_ref(),
                 )?;
-                let vote = self.replica.vote_for_proposal(&proposal)?;
-                self.persist()?;
-                round.order_votes.insert(vote.validator, vote);
-                round.proposal = Some(signed);
+                if let Some(vote) =
+                    skip_when_view_already_timed_out(self.replica.vote_for_proposal(&proposal))?
+                {
+                    self.persist()?;
+                    round.order_votes.insert(vote.validator, vote);
+                    round.proposal = Some(signed);
+                } else {
+                    debug!(
+                        height,
+                        view, "already timed out this view; not proposing into it"
+                    );
+                }
             }
             if let Some(proposal) = &round.proposal {
                 self.broadcast(WireMessage::Proposal(proposal.clone()))
@@ -417,13 +447,24 @@ impl ConsensusCoordinator {
             && let Some(signed) = round.observed_proposals.values().next()
         {
             let proposer = signed.proposal.proposer;
-            let mut vote = self.replica.vote_for_proposal(&signed.proposal)?;
-            self.persist()?;
+            let voted =
+                skip_when_view_already_timed_out(self.replica.vote_for_proposal(&signed.proposal))?;
+            // Marked either way: a view this replica has already timed out will
+            // never produce an order vote, so retrying on every tick would only
+            // spin and re-log until the timeout certificate advances the view.
             round.set(RoundFlag::ProposalVoteSent);
-            if self.faults.corrupt_votes && !vote.signature.is_empty() {
-                vote.signature[0] ^= 1;
+            if let Some(mut vote) = voted {
+                self.persist()?;
+                if self.faults.corrupt_votes && !vote.signature.is_empty() {
+                    vote.signature[0] ^= 1;
+                }
+                self.send(proposer, WireMessage::Vote(vote)).await;
+            } else {
+                debug!(
+                    height,
+                    view, "already timed out this view; skipping its order vote"
+                );
             }
-            self.send(proposer, WireMessage::Vote(vote)).await;
         }
 
         if self.id == leader
@@ -1042,6 +1083,28 @@ mod tests {
             bytes.extend_from_slice(parent_id.as_bytes());
             Some((vec![Hash::digest(bytes)], Hash::default()))
         }
+    }
+
+    #[test]
+    fn a_view_already_timed_out_skips_its_order_vote_instead_of_failing() {
+        // The replica refusing to cast both first-round votes in one view is
+        // the TD-022 safety rule working, and under a slow round it happens
+        // routinely: the round times out, then a delayed proposal arrives.
+        // Treating it as a local fault killed the coordinator outright, so a
+        // merely slow validator removed itself from the network.
+        assert!(
+            super::skip_when_view_already_timed_out(Err(
+                super::ConsensusError::ConflictingFirstRoundVote
+            ))
+            .expect("a timed-out view must skip its order vote, not fail")
+            .is_none()
+        );
+
+        // Every other consensus failure must still be fatal.
+        assert!(
+            super::skip_when_view_already_timed_out(Err(super::ConsensusError::LocalDoubleVote))
+                .is_err()
+        );
     }
 
     #[test]
