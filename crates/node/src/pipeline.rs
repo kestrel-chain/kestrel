@@ -5,6 +5,7 @@ use std::{
 };
 
 use consensus::FinalizedOrder;
+use execution::DeferredExecutionError;
 use libp2p::PeerId;
 use mempool::{FeeScope, LocalizedMempool, MempoolError, SubmittedTransaction};
 use network::{
@@ -491,7 +492,22 @@ impl Stage2Pipeline {
             let Some(payload) = self.source.payload_for_order(&order)? else {
                 return Ok(());
             };
-            self.lifecycle.submit_payload(order, &payload)?;
+            if let Err(error) = self.lifecycle.submit_payload(order, &payload) {
+                if is_execution_backpressure(&error) {
+                    // The deferred executor is one block behind. That is the
+                    // backpressure the spec mandates, not a fault: leave the
+                    // order in `pending_orders` and retry on the next tick, once
+                    // `poll_commit` has drained a completed block and freed the
+                    // slot. Treating it as fatal crashed the pipeline under
+                    // sustained load -- the executor legitimately falls a block
+                    // behind at high throughput, so the node killed itself
+                    // exactly when it was busiest, and two such deaths cost the
+                    // network its quorum. The `maximum_pending_orders` bound
+                    // above still catches execution that has genuinely stopped.
+                    return Ok(());
+                }
+                return Err(error.into());
+            }
             self.pending_orders.remove(&height);
             // A certified, submitted order is canonical for this height —
             // durable execution/commit still has to happen, but no other
@@ -1032,6 +1048,18 @@ pub enum PipelineError {
     Storage(#[from] StorageError),
 }
 
+/// Whether a submit-payload failure is the deferred executor reporting it is one
+/// block behind -- the backpressure `consensus-spec` mandates, to be retried,
+/// not a fault. It is the executor's own one-block bound, hit long before the
+/// pipeline's `maximum_pending_orders` backlog bound, so it must be handled
+/// gracefully rather than crashing the pipeline.
+fn is_execution_backpressure(error: &LifecycleError) -> bool {
+    matches!(
+        error,
+        LifecycleError::DeferredExecution(DeferredExecutionError::LagLimitReached)
+    )
+}
+
 /// Increments `peer`'s offense count and returns the new total.
 fn tally_offense(offense_counts: &mut BTreeMap<PeerId, u32>, peer: PeerId) -> u32 {
     let count = offense_counts.entry(peer).or_insert(0);
@@ -1058,9 +1086,14 @@ fn is_peer_misbehaviour(error: &PipelineError) -> bool {
         // Ordinary races between commit and in-flight gossip.
         PipelineError::NonceMismatch { .. }
             | PipelineError::SenderAlreadyReserved(_)
-            // Local congestion/limits, not the sender's doing.
+            // Local congestion/limits, not the sender's doing. Gossip errors
+            // here come from relaying a peer's shred failing because our own
+            // outbound queue is full -- backpressure under load, never the
+            // peer's fault. Counting it banned honest relaying peers, durably
+            // (TD-014), exactly when the network was busiest.
             | PipelineError::Mempool(_)
             | PipelineError::InflightShredLimitReached
+            | PipelineError::Gossip(_)
             // Our own internal faults are never the peer's fault.
             | PipelineError::LockPoisoned
             | PipelineError::Storage(_)
@@ -1125,6 +1158,27 @@ mod tests {
     }
 
     #[test]
+    fn executor_one_block_behind_is_treated_as_backpressure_not_a_crash() {
+        use super::is_execution_backpressure;
+        use crate::LifecycleError;
+        use execution::DeferredExecutionError;
+
+        // The deferred executor's one-block bound is the backpressure the spec
+        // mandates: retried, never fatal. Before this, it crashed the pipeline
+        // under sustained load, and two crashes cost the network its quorum.
+        assert!(is_execution_backpressure(
+            &LifecycleError::DeferredExecution(DeferredExecutionError::LagLimitReached)
+        ));
+
+        // A genuinely stopped worker, or any other lifecycle failure, is still
+        // fatal.
+        assert!(!is_execution_backpressure(
+            &LifecycleError::DeferredExecution(DeferredExecutionError::WorkerStopped)
+        ));
+        assert!(!is_execution_backpressure(&LifecycleError::OrderMismatch));
+    }
+
+    #[test]
     fn routine_gossip_races_are_not_counted_as_peer_offenses() {
         // An honest validator re-gossiping a transaction that has since
         // committed produces exactly this, and must never be banned for it.
@@ -1140,6 +1194,13 @@ mod tests {
             &PipelineError::InflightShredLimitReached
         ));
         assert!(!is_peer_misbehaviour(&PipelineError::LockPoisoned));
+
+        // A relay send failing because our own outbound queue is full is local
+        // backpressure, not the peer's fault -- it must not ban honest peers
+        // under load.
+        assert!(!is_peer_misbehaviour(&PipelineError::Gossip(
+            network::GossipError::ShredQueueUnavailable
+        )));
 
         // Genuine misbehaviour a peer is accountable for still counts, so the
         // TD-025 denial-of-service protection is unchanged.

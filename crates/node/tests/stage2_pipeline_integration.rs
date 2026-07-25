@@ -378,13 +378,16 @@ async fn stage2_pipeline_commits_a_gossiped_transaction_across_all_nodes() {
 /// tasks. Fixed by tracking a `retired_height` in `PipelineState` and
 /// refusing to build a proposal more than one height ahead of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[allow(clippy::too_many_lines)] // Keep the full multi-node wiring/assertion timeline auditable.
 async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
-    const TRANSACTION_COUNT: usize = 30;
+    run_concurrent_independent_senders(30).await;
+}
+
+#[allow(clippy::too_many_lines)] // Keep the full multi-node wiring/assertion timeline auditable.
+async fn run_concurrent_independent_senders(transaction_count: usize) {
     let log = captured_log();
     let directory = TempDir::new().unwrap();
 
-    let senders = (0..TRANSACTION_COUNT)
+    let senders = (0..transaction_count)
         .map(|index| {
             let key = *Hash::digest(index.to_le_bytes()).as_bytes();
             let public_key = Ed25519Scheme.public_key(&key).unwrap();

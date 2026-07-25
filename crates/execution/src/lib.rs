@@ -1011,6 +1011,103 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn a_full_one_block_buffer_is_recoverable_backpressure_not_a_worker_failure() {
+        use std::{thread::sleep, time::Duration};
+
+        use types::{Object, Owner};
+
+        use super::{
+            AccessMode, DeclaredObjectRef, DeferredExecutionError, DeferredExecutor,
+            ExecutableTransaction, MoveOperation, OrderedExecutionBlock,
+        };
+        use types::Hash;
+
+        let sender = Address::from_bytes([7; 32]);
+        let state = StateTree::new(StateConfig::default()).unwrap();
+        let executor = DeferredExecutor::new(state, 100, 4, 100).unwrap();
+
+        // Blocks heavy enough that executing one takes materially longer than
+        // enqueuing the next, so the one-block buffer reliably fills. A trivial
+        // block executes faster than it can be submitted and the buffer would
+        // never fill -- which is exactly why this bug does not reproduce in a
+        // debug build's end-to-end consensus/execution timing, and has to be
+        // tested at the executor boundary instead.
+        let block = |height: u64| {
+            let transactions = (0..800_u32)
+                .map(|index| {
+                    let id = Hash::digest(format!("repair-buffer-{height}-{index}").as_bytes());
+                    ExecutableTransaction {
+                        operation: MoveOperation::CreateObject {
+                            sender,
+                            object: Object {
+                                id,
+                                owner: Owner::Single(sender),
+                                type_tag: "test::Counter".to_owned(),
+                                version: 0,
+                                data: vec![0],
+                                rent_balance: 1_000,
+                            },
+                        },
+                        object_references: vec![DeclaredObjectRef {
+                            id,
+                            owner: Owner::Single(sender),
+                            access: AccessMode::Write,
+                        }],
+                        compute_limit: 1_000_000,
+                    }
+                })
+                .collect::<Vec<_>>();
+            OrderedExecutionBlock {
+                height,
+                consensus_block_id: Hash::digest(height.to_be_bytes()),
+                transaction_ids: transactions.iter().map(|_| Hash::default()).collect(),
+                transactions,
+            }
+        };
+
+        // Submit without ever draining a result until the buffer fills. At most
+        // two blocks can be outstanding (one executing, one buffered), so a
+        // handful of submits suffice. The value under test is *how* the full
+        // buffer is reported.
+        let mut height = 1_u64;
+        let full = loop {
+            match executor.submit(block(height)) {
+                Ok(()) => {
+                    height += 1;
+                    assert!(height < 100, "the one-block buffer never filled");
+                }
+                Err(error) => break error,
+            }
+        };
+
+        // A full buffer must be `LagLimitReached` -- the retriable backpressure
+        // the spec mandates -- never confused with `WorkerStopped`, a genuine
+        // fatal failure. The Stage 2 pipeline distinguishes them by exactly this
+        // variant; conflating them crashed the pipeline under sustained load and
+        // cost the network its quorum.
+        assert_eq!(full, DeferredExecutionError::LagLimitReached);
+
+        // It is transient: once the worker drains a block the buffer frees, and a
+        // retry then succeeds. Build the retry block once, then poll: drain any
+        // executed results, attempt the submit, and give the worker time.
+        let retry = block(height);
+        let mut resubmitted = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            while executor.try_result().unwrap().is_some() {}
+            if executor.submit(retry.clone()).is_ok() {
+                resubmitted = true;
+                break;
+            }
+            sleep(Duration::from_millis(20));
+        }
+        assert!(
+            resubmitted,
+            "backpressure must clear once execution catches up, but a retry never succeeded"
+        );
+    }
+
     fn token_source(address: Address) -> String {
         include_str!("../../vm-move/tests/fixtures/token.move")
             .replace("__KESTREL_PUBLISHER__", &address.to_string())
