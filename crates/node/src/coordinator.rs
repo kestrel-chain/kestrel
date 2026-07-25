@@ -129,6 +129,14 @@ enum WireMessage {
         transaction_ids: Option<Vec<Hash>>,
         fee_commitment: Option<Hash>,
     },
+    /// "I am behind; send me finalized orders starting at this height." Sent by
+    /// a validator that saw a certificate for a height beyond its own.
+    RequestOrders {
+        from_height: u64,
+    },
+    /// A contiguous batch of retained finalized orders answering a request,
+    /// ascending from the requested height.
+    Orders(Vec<FinalizedOrder>),
 }
 
 /// Supplies the canonical transaction IDs and fee commitment a leader should
@@ -172,6 +180,9 @@ pub struct ConsensusCoordinator {
     faults: CoordinatorFaults,
     proposal_source: Arc<dyn ProposalTransactionSource>,
     finalized_order_sender: Option<mpsc::UnboundedSender<FinalizedOrder>>,
+    /// When this validator last asked a peer to replay missing orders, used to
+    /// throttle catch-up requests.
+    last_catchup_request: Option<Instant>,
 }
 
 impl ConsensusCoordinator {
@@ -317,6 +328,7 @@ impl ConsensusCoordinator {
             faults,
             proposal_source,
             finalized_order_sender,
+            last_catchup_request: None,
         })
     }
 
@@ -694,6 +706,12 @@ impl ConsensusCoordinator {
                 }
                 verify_certificate(&certificate, &self.validators, self.scheme.as_ref())?;
                 if certificate.height != self.replica.height() {
+                    if certificate.height > self.replica.height() {
+                        // A verified certificate for a height beyond ours proves
+                        // we have fallen behind (it cannot be forged). Ask the
+                        // sender to replay the orders we are missing.
+                        self.request_catchup(envelope.sender).await;
+                    }
                     return Ok(None);
                 }
                 let certified_order = match certificate.kind {
@@ -751,8 +769,95 @@ impl ConsensusCoordinator {
                     }
                 }
             }
+            WireMessage::RequestOrders { from_height } => {
+                let orders = self.load_finalized_orders(
+                    from_height,
+                    from_height.saturating_add(MAXIMUM_CATCHUP_BATCH as u64),
+                )?;
+                if !orders.is_empty() {
+                    self.send(envelope.sender, WireMessage::Orders(orders))
+                        .await;
+                }
+            }
+            WireMessage::Orders(orders) => {
+                return self.apply_catchup_orders(orders, round);
+            }
         }
         Ok(None)
+    }
+
+    /// Asks `peer` to replay the finalized orders this validator is missing,
+    /// throttled so repeated behind-signals do not flood the peer.
+    async fn request_catchup(&mut self, peer: Hash) {
+        let now = Instant::now();
+        if self
+            .last_catchup_request
+            .is_some_and(|last| now.duration_since(last) < CATCHUP_REQUEST_INTERVAL)
+        {
+            return;
+        }
+        self.last_catchup_request = Some(now);
+        let from_height = self.replica.height();
+        debug!(from_height, %peer, "fell behind; requesting catch-up orders");
+        self.send(peer, WireMessage::RequestOrders { from_height })
+            .await;
+    }
+
+    /// Replays a peer's finalized orders to catch up. Each is untrusted, so its
+    /// certificate is verified against the (immutable) validator set and its
+    /// certified order is bound to the certificate's block id exactly as the
+    /// live path does, before it is finalized. Orders apply strictly in height
+    /// order; a gap or any invalid order stops the batch without failing.
+    fn apply_catchup_orders(
+        &mut self,
+        orders: Vec<FinalizedOrder>,
+        round: &mut RoundState,
+    ) -> Result<Option<CoordinatorOutcome>, CoordinatorError> {
+        let mut last_outcome = None;
+        let mut advanced = false;
+        for order in orders {
+            if order.height < self.replica.height() {
+                continue;
+            }
+            if order.height != self.replica.height() {
+                break;
+            }
+            if !matches!(
+                order.certificate.kind,
+                CertificateKind::Fast | CertificateKind::Commit
+            ) || order.certificate.height != order.height
+                || order.certificate.block_id != order.block_id
+                || verify_certificate(&order.certificate, &self.validators, self.scheme.as_ref())
+                    .is_err()
+            {
+                break;
+            }
+            let leader = self
+                .validators
+                .leader(order.certificate.height, order.certificate.view)
+                .id;
+            let expected = Proposal::new(
+                order.certificate.height,
+                order.certificate.view,
+                self.replica.parent_id(),
+                leader,
+                order.transaction_ids.clone(),
+                order.fee_commitment,
+                None,
+            );
+            if expected.block_id != order.certificate.block_id {
+                break;
+            }
+            // The certificate is verified above, so `commit_finalized_order` can
+            // only fail on a genuine internal fault, which stays fatal.
+            last_outcome = Some(self.commit_finalized_order(order, 0)?);
+            advanced = true;
+        }
+        if advanced {
+            debug!(height = self.replica.height(), "caught up to a peer");
+            *round = RoundState::new_height();
+        }
+        Ok(last_outcome)
     }
 
     async fn apply_prepare(
@@ -790,43 +895,65 @@ impl ConsensusCoordinator {
         if certificate.height != self.replica.height() {
             return Ok(None);
         }
-        let finalized_height = certificate.height;
-        let finalized_block = self.replica.finalize(certificate)?;
+        let latency = u64::try_from(round.height_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let order = FinalizedOrder {
+            height: certificate.height,
+            block_id: certificate.block_id,
+            transaction_ids,
+            fee_commitment,
+            certificate: certificate.clone(),
+        };
+        let outcome = self.commit_finalized_order(order, latency)?;
+        *round = RoundState::new_height();
+        Ok(Some(outcome))
+    }
+
+    /// Finalizes one certified order at the replica's current height: advances
+    /// the replica, persists safety state and the order (for catch-up serving),
+    /// updates RPC status, and hands the order to execution. Shared by the live
+    /// consensus path and catch-up replay; the caller has already verified the
+    /// certificate and that `order.height == self.replica.height()`.
+    fn commit_finalized_order(
+        &mut self,
+        order: FinalizedOrder,
+        latency_ms: u64,
+    ) -> Result<CoordinatorOutcome, CoordinatorError> {
+        let finalized_height = order.height;
+        let view = order.certificate.view;
+        let finalized_block = self.replica.finalize(&order.certificate)?;
         debug!(
             height = finalized_height,
-            view = certificate.view,
+            view,
             block = %finalized_block,
             "finalized height"
         );
         self.persist()?;
-        let latency = u64::try_from(round.height_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let outcome = CoordinatorOutcome {
             finalized_height,
             finalized_block,
-            finality_latency_ms: latency,
-            view_changes: certificate.view,
+            finality_latency_ms: latency_ms,
+            view_changes: view,
         };
         if let Ok(mut status) = self.status.write() {
             status.finalized_height = finalized_height;
             status.finalized_block = finalized_block;
             status.peer_count = self.peers.len().saturating_sub(1);
             status.ready = true;
-            status.finality_latency_ms = Some(latency);
-            status.view_changes = certificate.view;
+            status.finality_latency_ms = Some(latency_ms);
+            status.view_changes = view;
         }
+        // Retain recent finalized orders durably so a peer that fell behind can
+        // request and replay the heights it missed. Without this a validator
+        // that restarts or is briefly partitioned can never rejoin: `finalize`
+        // only accepts a certificate for its exact current height, and nothing
+        // else can supply the missing ones.
+        self.persist_finalized_order(&order)?;
         if let Some(sender) = &self.finalized_order_sender {
             sender
-                .send(FinalizedOrder {
-                    height: finalized_height,
-                    block_id: finalized_block,
-                    transaction_ids,
-                    fee_commitment,
-                    certificate: certificate.clone(),
-                })
+                .send(order)
                 .map_err(|_| CoordinatorError::FinalizedOrderSinkClosed)?;
         }
-        *round = RoundState::new_height();
-        Ok(Some(outcome))
+        Ok(outcome)
     }
 
     async fn broadcast_equivocation(&self, height: u64, view: u64) -> Result<(), CoordinatorError> {
@@ -920,6 +1047,60 @@ impl ConsensusCoordinator {
         self.store.put(SAFETY_STATE_KEY, &bytes)?;
         Ok(())
     }
+
+    /// Durably retains `order` for catch-up serving, pruning history older than
+    /// `CATCHUP_RETENTION` heights so the retained range stays bounded.
+    fn persist_finalized_order(&self, order: &FinalizedOrder) -> Result<(), CoordinatorError> {
+        let bytes =
+            bcs::to_bytes(order).map_err(|error| CoordinatorError::Encoding(error.to_string()))?;
+        self.store.put(&catchup_order_key(order.height), &bytes)?;
+        if let Some(prune_below) = order.height.checked_sub(CATCHUP_RETENTION) {
+            self.store.delete(&catchup_order_key(prune_below))?;
+        }
+        Ok(())
+    }
+
+    /// Reads the retained finalized orders for `from_height..=to_height`,
+    /// capped at `MAXIMUM_CATCHUP_BATCH` to bound a single response, in height
+    /// order. A gap (a height already pruned) stops the batch, since orders must
+    /// be applied contiguously.
+    fn load_finalized_orders(
+        &self,
+        from_height: u64,
+        to_height: u64,
+    ) -> Result<Vec<FinalizedOrder>, CoordinatorError> {
+        let mut orders = Vec::new();
+        for height in from_height..=to_height {
+            if orders.len() >= MAXIMUM_CATCHUP_BATCH {
+                break;
+            }
+            let Some(bytes) = self.store.get(&catchup_order_key(height))? else {
+                break;
+            };
+            orders.push(
+                bcs::from_bytes::<FinalizedOrder>(&bytes)
+                    .map_err(|error| CoordinatorError::Encoding(error.to_string()))?,
+            );
+        }
+        Ok(orders)
+    }
+}
+
+const CATCHUP_KEY_PREFIX: &[u8] = b"consensus/catchup/order/v1/";
+/// Finalized heights retained for serving catch-up. A restarted or briefly
+/// partitioned validator that fell no further behind than this can rejoin by
+/// replaying; one further behind needs full state sync (TD-012).
+const CATCHUP_RETENTION: u64 = 1_024;
+/// Orders returned in a single catch-up response, bounding its size.
+const MAXIMUM_CATCHUP_BATCH: usize = 64;
+/// Minimum spacing between a validator's catch-up requests, so a run of
+/// behind-signals asks a peer to replay at most once per interval.
+const CATCHUP_REQUEST_INTERVAL: Duration = Duration::from_millis(200);
+
+fn catchup_order_key(height: u64) -> Vec<u8> {
+    let mut key = CATCHUP_KEY_PREFIX.to_vec();
+    key.extend_from_slice(&height.to_be_bytes());
+    key
 }
 
 struct RoundState {
@@ -1421,6 +1602,89 @@ mod tests {
                 .iter()
                 .all(|outcome| outcome.finalized_block == outcomes[0].finalized_block)
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_late_starting_validator_catches_up_to_the_others() {
+        const STOP_AFTER: u64 = 8;
+        const LATE: usize = 4;
+        let _serialised = REAL_TCP_TESTS.lock().await;
+        let directory = TempDir::new().unwrap();
+        let (genesis, keys) = fixture_genesis(5);
+        let validated = genesis.validate().unwrap();
+
+        let mut tasks = Vec::new();
+        // Keep the finalized-order receivers alive: `commit_finalized_order`
+        // emits into them, and a dropped receiver would close the sink and
+        // fail every node's first finalize.
+        let mut receivers = Vec::new();
+        for (index, entry) in genesis.validators.iter().enumerate() {
+            let status = Arc::new(RwLock::new(NodeStatus {
+                chain_id: genesis.chain_id.clone(),
+                genesis_hash: validated.genesis_hash,
+                finalized_height: 0,
+                committed_height: 0,
+                finalized_block: validated.genesis_hash,
+                state_root: validated.state_root,
+                peer_count: 0,
+                ready: false,
+                finality_latency_ms: None,
+                view_changes: 0,
+            }));
+            let (finalized_order_sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+            receivers.push(receiver);
+            let coordinator = ConsensusCoordinator::bind_with_pipeline(
+                &genesis,
+                entry.validator.id,
+                keys[index].clone(),
+                directory.path().join(index.to_string()),
+                status,
+                CoordinatorConfig {
+                    stop_after_height: Some(STOP_AFTER),
+                    ..CoordinatorConfig::default()
+                },
+                CoordinatorFaults::default(),
+                Arc::new(PipelineSource),
+                finalized_order_sender,
+            )
+            .await
+            .unwrap();
+            let genesis_time = genesis.genesis_unix_ms;
+            tasks.push(tokio::spawn(async move {
+                if index == LATE {
+                    // Start well after genesis so the other four (a 4-of-5
+                    // quorum) finalize several heights without this node. It can
+                    // then only reach the stop height by catching up on the
+                    // heights it missed, not by participating from genesis.
+                    tokio::time::sleep(Duration::from_millis(1_200)).await;
+                }
+                coordinator.run(genesis_time).await.unwrap()
+            }));
+        }
+
+        let outcomes = tokio::time::timeout(REAL_TCP_CONSENSUS_BOUND, async {
+            let mut outcomes = Vec::new();
+            for task in tasks {
+                outcomes.push(task.await.unwrap());
+            }
+            outcomes
+        })
+        .await
+        .expect("the late validator never caught up, so its run() never reached the stop height");
+
+        // Every validator, including the late one, reached the same height and
+        // block. The late one could only have done so by catching up.
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.finalized_height == STOP_AFTER)
+        );
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.finalized_block == outcomes[0].finalized_block)
+        );
+        drop(receivers);
     }
 
     fn fixture_genesis(count: u8) -> (GenesisDocument, Vec<Vec<u8>>) {
