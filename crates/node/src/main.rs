@@ -229,12 +229,17 @@ async fn main() -> Result<()> {
         rpc_state = Arc::new(RwLock::new(state));
     }
 
-    let service = RpcService::new(
-        RpcConfig::default(),
-        Arc::clone(&status),
-        rpc_state,
-        submitter,
-    )?;
+    // The per-source-IP request limit defaults to 1000/s, which is a sensible
+    // abuse control but also a hard ceiling on any load test driving a node
+    // from one address: past it, submissions are refused rather than slowed, so
+    // a throughput measurement reports the limiter rather than the chain.
+    // Operators running load tests need to raise it deliberately (TD-019).
+    let rpc_config = RpcConfig {
+        requests_per_window: parse_optional(&arguments, "--rpc-requests-per-second")?
+            .unwrap_or(RpcConfig::default().requests_per_window),
+        ..RpcConfig::default()
+    };
+    let service = RpcService::new(rpc_config, Arc::clone(&status), rpc_state, submitter)?;
 
     let listener = TcpListener::bind(rpc_address).await?;
     info!(%rpc_address, genesis = %validated.genesis_hash, "validator RPC ready");

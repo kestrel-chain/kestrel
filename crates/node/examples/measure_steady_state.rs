@@ -213,6 +213,12 @@ fn run_once(validator_count: u8, duration_secs: f64, target_rate: f64) -> RunRes
                 gossip_key_path.to_str().unwrap(),
                 "--data-dir",
                 data_path.to_str().unwrap(),
+                // Raise the per-source-IP RPC limit well clear of any rate this
+                // sweep offers. All load originates from one address, so the
+                // default 1000/s would refuse submissions above it and the
+                // result would measure the limiter rather than the chain.
+                "--rpc-requests-per-second",
+                "1000000",
             ])
             .env("RUST_LOG", "node=debug")
             .stdout(Stdio::from(fs::File::create(&log_paths[index]).unwrap()))
