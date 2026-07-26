@@ -64,6 +64,20 @@ pub struct Stage2PipelineConfig {
     /// payload and are bound by the certified fee commitment.
     pub payload_repair_delay: Duration,
     pub maximum_payload_repair_backoff: Duration,
+    /// How long execution may make no forward progress while its order backlog
+    /// exceeds [`maximum_pending_orders`](Self::maximum_pending_orders) before
+    /// the validator declares a genuine execution stall and stops.
+    ///
+    /// The backlog bound alone cannot tell a *frozen* validator from a *busy*
+    /// one: a validator that fell behind and is catching up (re-fetching the
+    /// payloads it missed and executing them in a burst) legitimately holds a
+    /// backlog far above the steady-state bound while it works through it. What
+    /// distinguishes the two is progress — catching up keeps advancing
+    /// `submitted_height`, a genuine stall does not. So an over-bound backlog is
+    /// fatal only if it also stays completely frozen for this whole window,
+    /// which is set comfortably above the payload-repair backoff so ordinary
+    /// catch-up (or a slow repair round-trip) is never mistaken for a stall.
+    pub execution_stall_grace: Duration,
 }
 
 impl Default for Stage2PipelineConfig {
@@ -85,6 +99,11 @@ impl Default for Stage2PipelineConfig {
             maximum_pending_orders: 64,
             payload_repair_delay: Duration::from_millis(500),
             maximum_payload_repair_backoff: Duration::from_secs(8),
+            // Above the 8s repair backoff cap, so a validator catching up
+            // through missed payloads — which advances in bursts separated by
+            // repair round-trips — is never mistaken for one whose execution
+            // has genuinely stopped.
+            execution_stall_grace: Duration::from_secs(30),
         }
     }
 }
@@ -169,6 +188,14 @@ pub struct Stage2Pipeline {
     /// the current backoff between asks. Cleared whenever a height is submitted.
     repair_after: Option<Instant>,
     repair_backoff: Duration,
+    /// Highest `submitted_height` seen the last time the backlog was checked.
+    /// Any advance past it proves execution is still draining the backlog and
+    /// resets the stall clock.
+    progress_height: u64,
+    /// When the backlog first exceeded the bound with no execution progress
+    /// since. `None` whenever the backlog is healthy or execution is advancing;
+    /// once it has stayed set for `execution_stall_grace`, the stall is fatal.
+    stalled_since: Option<Instant>,
 }
 
 impl Stage2Pipeline {
@@ -296,6 +323,8 @@ impl Stage2Pipeline {
                 inbound_repair_requests: network_node.inbound_repair_requests,
                 repair_after: None,
                 repair_backoff: config.payload_repair_delay,
+                progress_height: submitted_height,
+                stalled_since: None,
             },
             handle,
         ))
@@ -347,24 +376,10 @@ impl Stage2Pipeline {
                 Some(order) = self.finalized_orders.recv() => {
                     self.pending_orders.insert(order.height, order);
                     // Drain first: a backlog that clears is ordinary deferred
-                    // execution, not a fault. Only what remains afterwards
-                    // counts against the bound.
+                    // execution, not a fault. Only a backlog that both exceeds
+                    // the bound and stays frozen counts as a stall.
                     self.submit_available_orders()?;
-                    if self.pending_orders.len() > self.config.maximum_pending_orders {
-                        let awaiting_height = self.submitted_height.saturating_add(1);
-                        warn!(
-                            pending = self.pending_orders.len(),
-                            limit = self.config.maximum_pending_orders,
-                            awaiting_height,
-                            "execution has fallen too far behind ordering; stopping this validator \
-                             rather than continuing to finalize blocks it cannot execute"
-                        );
-                        return Err(PipelineError::ExecutionBacklogExceeded {
-                            pending: self.pending_orders.len(),
-                            limit: self.config.maximum_pending_orders,
-                            awaiting_height,
-                        });
-                    }
+                    self.enforce_execution_progress()?;
                 }
                 Some((peer, height)) = self.inbound_repair_requests.recv() => {
                     // Serving a peer is best-effort: not holding the payload is
@@ -377,6 +392,11 @@ impl Stage2Pipeline {
                     self.submit_available_orders()?;
                     self.request_payload_repair_if_stuck();
                     self.lifecycle.poll_commit()?;
+                    // A block just committed frees the executor slot; hand it the
+                    // next height immediately so a catching-up validator drains
+                    // its backlog at execution speed rather than one per tick.
+                    self.submit_available_orders()?;
+                    self.enforce_execution_progress()?;
                 }
                 else => return Err(PipelineError::PipelineClosed),
             }
@@ -481,6 +501,60 @@ impl Stage2Pipeline {
             .saturating_mul(2)
             .min(self.config.maximum_payload_repair_backoff);
         self.repair_after = Some(now + self.repair_backoff);
+    }
+
+    /// Stops the validator only if execution has *genuinely* stalled: its order
+    /// backlog exceeds the bound and has made no forward progress for the whole
+    /// [`execution_stall_grace`](Stage2PipelineConfig::execution_stall_grace)
+    /// window.
+    ///
+    /// A backlog on its own is not a fault — ordering leads execution by design,
+    /// and a validator catching up on missed heights holds a large backlog
+    /// while it re-fetches and executes them. The earlier instantaneous
+    /// "backlog over bound ⇒ fatal" check could not tell that apart from a real
+    /// stall, so a rejoining validator killed itself the moment catch-up
+    /// delivered more than a buffer's worth of orders faster than it could fetch
+    /// their payloads. Keying the failure on *lack of progress* preserves the
+    /// original guard against genuinely frozen execution (which must not keep
+    /// voting on blocks it will never execute) while letting catch-up proceed.
+    fn enforce_execution_progress(&mut self) -> Result<(), PipelineError> {
+        // Any advance means execution is still draining the backlog: reset.
+        if self.submitted_height > self.progress_height {
+            self.progress_height = self.submitted_height;
+            self.stalled_since = None;
+            return Ok(());
+        }
+        if self.pending_orders.len() <= self.config.maximum_pending_orders {
+            // Within the ordinary lead of ordering over execution.
+            self.stalled_since = None;
+            return Ok(());
+        }
+        let now = Instant::now();
+        let stalled_since = *self.stalled_since.get_or_insert(now);
+        let stalled_for = now.duration_since(stalled_since);
+        if !backlog_is_a_genuine_stall(
+            self.pending_orders.len(),
+            self.config.maximum_pending_orders,
+            stalled_for,
+            self.config.execution_stall_grace,
+        ) {
+            return Ok(());
+        }
+        let awaiting_height = self.submitted_height.saturating_add(1);
+        warn!(
+            pending = self.pending_orders.len(),
+            limit = self.config.maximum_pending_orders,
+            awaiting_height,
+            stalled_ms = stalled_for.as_millis(),
+            "execution made no progress while its order backlog stayed over the bound for the \
+             whole grace window; stopping this validator rather than finalizing blocks it cannot \
+             execute"
+        );
+        Err(PipelineError::ExecutionBacklogExceeded {
+            pending: self.pending_orders.len(),
+            limit: self.config.maximum_pending_orders,
+            awaiting_height,
+        })
     }
 
     fn submit_available_orders(&mut self) -> Result<(), PipelineError> {
@@ -1060,6 +1134,23 @@ fn is_execution_backpressure(error: &LifecycleError) -> bool {
     )
 }
 
+/// Whether an order backlog now represents a genuinely stalled execution rather
+/// than a validator that is merely behind and catching up.
+///
+/// It is a stall only if the backlog both exceeds the steady-state bound *and*
+/// has stayed frozen (no `submitted_height` progress) for the entire grace
+/// window. A backlog within the bound, or one that is still advancing (grace
+/// window not yet elapsed because progress keeps resetting it), is normal
+/// deferred execution or catch-up, never a fault.
+fn backlog_is_a_genuine_stall(
+    pending: usize,
+    limit: usize,
+    stalled_for: Duration,
+    grace: Duration,
+) -> bool {
+    pending > limit && stalled_for >= grace
+}
+
 /// Increments `peer`'s offense count and returns the new total.
 fn tally_offense(offense_counts: &mut BTreeMap<PeerId, u32>, peer: PeerId) -> u32 {
     let count = offense_counts.entry(peer).or_insert(0);
@@ -1176,6 +1267,53 @@ mod tests {
             &LifecycleError::DeferredExecution(DeferredExecutionError::WorkerStopped)
         ));
         assert!(!is_execution_backpressure(&LifecycleError::OrderMismatch));
+    }
+
+    #[test]
+    fn a_catching_up_backlog_is_not_a_stall_but_a_frozen_one_is() {
+        use super::backlog_is_a_genuine_stall;
+        use std::time::Duration;
+
+        let limit = 64;
+        let grace = Duration::from_secs(30);
+
+        // A backlog within the bound is ordinary deferred execution, whatever
+        // the elapsed time — ordering is allowed to lead execution.
+        assert!(!backlog_is_a_genuine_stall(limit, limit, grace, grace));
+        assert!(!backlog_is_a_genuine_stall(
+            10,
+            limit,
+            Duration::from_secs(3_600),
+            grace
+        ));
+
+        // Over the bound but not yet frozen for the whole window: this is a
+        // validator catching up on missed heights, re-fetching payloads and
+        // executing them in a burst. It must NOT be killed — the exact case
+        // where the old instantaneous check crashed a rejoining validator.
+        assert!(!backlog_is_a_genuine_stall(
+            1_000,
+            limit,
+            Duration::from_secs(29),
+            grace
+        ));
+        assert!(!backlog_is_a_genuine_stall(
+            limit + 1,
+            limit,
+            Duration::ZERO,
+            grace
+        ));
+
+        // Over the bound AND frozen for the whole grace window: execution has
+        // genuinely stopped and the validator must stop rather than keep voting
+        // on blocks it will never execute.
+        assert!(backlog_is_a_genuine_stall(limit + 1, limit, grace, grace));
+        assert!(backlog_is_a_genuine_stall(
+            1_000,
+            limit,
+            Duration::from_secs(45),
+            grace
+        ));
     }
 
     #[test]

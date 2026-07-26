@@ -107,3 +107,112 @@ reviewed:
   durably, since bans are now persisted (TD-014). Fixed by classifying local
   gossip-queue backpressure as never-the-peer's-fault, guarded by
   `routine_gossip_races_are_not_counted_as_peer_offenses`.
+
+---
+
+## INC-002 — A rejoining validator killed itself catching up
+
+- **Severity:** Critical (a validator that restarts can never rejoin; it dies
+  during catch-up instead of recovering).
+- **Component:** `crates/node/src/pipeline.rs` (`Stage2Pipeline`), at the
+  boundary with the catch-up path in `crates/node/src/coordinator.rs`.
+- **Status:** Fixed.
+
+### Symptom
+
+On a healthy four-validator network, cleanly stopping one validator and then
+restarting it wedged the *restarted* validator within a second of rejoining. Its
+log showed catch-up starting correctly and then, mid-burst, a fatal stop:
+
+```
+DEBUG caught up to a peer height=801
+DEBUG caught up to a peer height=865
+WARN  execution has fallen too far behind ordering; stopping this validator …
+      pending=65 limit=64 awaiting_height=737
+ERROR Stage 2 pipeline stopped: 65 certified orders undelivered to execution (limit 64) …
+ERROR consensus coordinator stopped: the finalized-order execution sink is closed
+```
+
+The pipeline task exited, dropped the finalized-order channel, and took the
+coordinator down with it (the same cascade as INC-001). The validator was left
+frozen at the height it had reached, permanently out of the network.
+
+### Root cause
+
+This is a second instance of INC-001's bug class — a transient, expected backlog
+misclassified as a fatal error — reached through a path the INC-001 audit did not
+cover, and in fact *introduced* by the validator-catch-up feature (commit
+"Let a behind validator catch up on finalized orders it missed").
+
+When a restarted validator rejoins, its coordinator catches up by finalizing the
+orders it missed, in bursts of up to a full catch-up batch (64) back to back. It
+pushes each finalized order into the pipeline's unbounded intake channel. The
+pipeline drains that into `pending_orders` and submits them to execution in
+height order — but execution of a caught-up height needs that height's *payload*,
+which the validator never received while it was down and must now re-fetch via
+payload repair. So ordering raced hundreds of blocks ahead while execution waited
+on repairs, `pending_orders` blew past `maximum_pending_orders` (64), and the
+bound — written to catch execution that had *genuinely stopped* — fired on a
+validator that was simply busy catching up.
+
+The INC-001 write-up had explicitly reasoned that `maximum_pending_orders` was
+the *legitimate* detector of stopped execution. That was true for the steady
+state it was written against; catch-up introduced a new, benign source of large
+transient backlog that the instantaneous check could not tell from a real stall.
+
+### Detection
+
+Found by running a real four-node network on one host, cleanly killing a
+validator (the remaining three kept finalizing — f=1 tolerance is intact), then
+restarting it and watching it die. The node log named the exact bound and height,
+which distinguished this from a network-wide fault: the rest of the network was
+unaffected; only the rejoining node stopped.
+
+### Fix
+
+Key the failure on *lack of progress*, not on backlog size alone. A backlog over
+the bound is fatal only if execution has made **no** forward progress
+(`submitted_height` unchanged) for a whole `execution_stall_grace` window
+(default 30s, above the 8s payload-repair backoff cap). A validator catching up
+keeps advancing `submitted_height` as repaired payloads arrive, so it is never
+killed; a genuinely frozen validator advances not at all and is still stopped, as
+before — preserving INC-001's guarantee that a validator cannot keep voting on
+blocks it will never execute. The per-tick submit was also made to re-run after
+`poll_commit` frees the executor slot, so catch-up drains at execution speed
+rather than one height per tick.
+
+A separate, real limitation remains and is *by design*, not a bug: catch-up
+retains only a bounded window of finalized orders (`CATCHUP_RETENTION`, 1024
+heights). A validator that falls further behind than that window cannot be
+recovered by catch-up at all and now stops cleanly (no progress ⇒ genuine stall)
+rather than freezing silently. Full state sync for that case is future work.
+
+### Regression guards
+
+- `node`: `a_catching_up_backlog_is_not_a_stall_but_a_frozen_one_is` — drives the
+  `backlog_is_a_genuine_stall` predicate directly: a backlog within the bound, or
+  one over the bound but not yet frozen for the grace window (the catch-up case),
+  is never a stall; a backlog over the bound and frozen for the whole window is.
+- `node`: `a_late_starting_validator_catches_up_to_the_others` — a real-TCP test
+  in which a validator joins after a quorum has finalized past it and must reach
+  the stop height purely by catching up. It was previously flaky (see below) and
+  is now race-free.
+- Behavioural proof: the same kill-and-rejoin on the live devnet that reproduced
+  the death now lets the validator catch up and resume finalizing. Like INC-001,
+  the end-to-end reproduction depends on release-speed ordering outrunning
+  execution and does not occur in a debug `cargo test`, which is why the
+  permanent guard lives at the classifier boundary.
+
+### A flaky test, fixed alongside
+
+The catch-up test above originally had every validator, including the late one,
+run to a fixed stop height. Catch-up is triggered only by *receiving* a
+certificate fresher than one's own height, so if the four peers reached the stop
+height and exited before the late validator engaged, it never got a trigger and
+hung the full consensus bound. Whether that happened was a wall-clock race, and a
+faster machine made it *more* likely (the peers finished sooner) — so it passed
+locally and failed in CI. The fix makes the peers run until aborted rather than
+to a stop height: a quorum is always live for the late validator to trigger on
+and fetch from, on any hardware. The assertion became "the late validator reached
+at least the stop height", since a single catch-up batch can carry it several
+heights past the quorum in one step.
