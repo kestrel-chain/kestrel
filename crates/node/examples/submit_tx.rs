@@ -4,7 +4,7 @@
 //! Usage:
 //!
 //! ```text
-//! cargo run -p node --example submit_tx -- [NONCE] [DATA_BYTE]
+//! cargo run -p node --example submit_tx -- [ACCOUNT_SEED] [NONCE] [DATA_BYTE]
 //! ```
 //!
 //! The hex transaction is printed on stdout (nothing else), so it can be piped
@@ -18,11 +18,16 @@ use types::{Hash, Object, Owner, Transaction};
 
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let nonce: u64 = arguments.first().and_then(|a| a.parse().ok()).unwrap_or(0);
-    let data: u8 = arguments.get(1).and_then(|a| a.parse().ok()).unwrap_or(1);
+    // ACCOUNT_SEED lets a load generator mint unlimited *independent* senders:
+    // a fresh seed each call means a fresh account, so every transaction uses
+    // nonce 0 and needs no cross-transaction nonce coordination.
+    let account_seed: u64 = arguments.first().and_then(|a| a.parse().ok()).unwrap_or(0);
+    let nonce: u64 = arguments.get(1).and_then(|a| a.parse().ok()).unwrap_or(0);
+    let data: u8 = arguments.get(2).and_then(|a| a.parse().ok()).unwrap_or(1);
 
-    // Fixed demo account (scheme 1 = Ed25519).
-    let account_key = [42_u8; 32];
+    // Deterministic demo account per seed (scheme 1 = Ed25519). Never use these
+    // keys for anything real.
+    let account_key = *Hash::digest(format!("kestrel-soak-account/{account_seed}")).as_bytes();
     let public_key = Ed25519Scheme.public_key(&account_key).unwrap();
     let sender = Ed25519Scheme.address(&public_key).unwrap();
 

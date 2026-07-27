@@ -22,27 +22,47 @@ use tokio::{
     sync::mpsc,
     time::{MissedTickBehavior, interval, sleep, timeout},
 };
-use tracing::debug;
+use tracing::{debug, warn};
 use types::Hash;
 
 use crate::{GenesisDocument, GenesisError};
 
-/// Reclassifies an honest replica's refusal to cast both first-round votes in
-/// one view as "skip this vote", not a local fault.
+/// Reclassifies an honest replica's *safe refusal to sign a vote* as "skip this
+/// vote", not a fatal fault. Two refusals are safe and can both happen in normal
+/// operation; every other consensus failure stays fatal.
 ///
-/// A replica that has already cast this view's timeout vote must not also cast
-/// an order vote for it — that mutual exclusion is the TD-022 safety rule and
-/// is working as intended. But under a slow round it is an ordinary race: the
-/// round timed out, and only then did a delayed proposal arrive. Propagating
-/// the refusal killed the whole coordinator task, so a validator that merely
-/// ran slowly took itself off the network instead of waiting for the timeout
-/// certificate to advance the view. Every other consensus failure stays fatal.
-fn skip_when_view_already_timed_out(
+/// - `ConflictingFirstRoundVote`: the replica already cast this view's timeout
+///   vote and must not also cast an order vote for it (the TD-022 mutual
+///   exclusion). Under a slow round this is an ordinary race — the round timed
+///   out, then a delayed proposal arrived.
+///
+/// - `LocalDoubleVote`: the replica already cast an order vote for a *different*
+///   block at this exact height/view. This legitimately happens after a
+///   **restart**: a leader proposed and self-voted a block at (H, V), restarted
+///   with that vote persisted but the in-memory proposal lost, and — its mempool
+///   having changed meanwhile — rebuilt a *different* block at the same (H, V).
+///   The refusal is the equivocation guard working correctly. Crucially it fires
+///   on the leader's *self-vote*, before the new proposal is broadcast, so
+///   skipping it also prevents the leader from equivocating on the wire; the
+///   node then advances that height by catching up instead.
+///
+/// Propagating either refusal killed the whole coordinator task, taking a merely
+/// slow or freshly restarted validator off the network — a total liveness loss
+/// (INC-003) of the same class as INC-001/INC-002. Refusing to cast the vote is
+/// the safe action, so it is skipped and logged rather than fatal.
+fn skip_safe_vote_refusal(
     result: Result<Vote, ConsensusError>,
 ) -> Result<Option<Vote>, ConsensusError> {
     match result {
         Ok(vote) => Ok(Some(vote)),
         Err(ConsensusError::ConflictingFirstRoundVote) => Ok(None),
+        Err(ConsensusError::LocalDoubleVote) => {
+            warn!(
+                "declined to sign a second, different vote for one height/view; skipping it \
+                 (expected after a restart re-proposal) rather than failing"
+            );
+            Ok(None)
+        }
         Err(error) => Err(error),
     }
 }
@@ -457,7 +477,7 @@ impl ConsensusCoordinator {
                     self.scheme.as_ref(),
                 )?;
                 if let Some(vote) =
-                    skip_when_view_already_timed_out(self.replica.vote_for_proposal(&proposal))?
+                    skip_safe_vote_refusal(self.replica.vote_for_proposal(&proposal))?
                 {
                     self.persist()?;
                     round.order_votes.insert(vote.validator, vote);
@@ -486,8 +506,7 @@ impl ConsensusCoordinator {
             && let Some(signed) = round.observed_proposals.values().next()
         {
             let proposer = signed.proposal.proposer;
-            let voted =
-                skip_when_view_already_timed_out(self.replica.vote_for_proposal(&signed.proposal))?;
+            let voted = skip_safe_vote_refusal(self.replica.vote_for_proposal(&signed.proposal))?;
             // Marked either way: a view this replica has already timed out will
             // never produce an order vote, so retrying on every tick would only
             // spin and re-log until the timeout certificate advances the view.
@@ -1325,23 +1344,31 @@ mod tests {
     }
 
     #[test]
-    fn a_view_already_timed_out_skips_its_order_vote_instead_of_failing() {
-        // The replica refusing to cast both first-round votes in one view is
-        // the TD-022 safety rule working, and under a slow round it happens
+    fn a_safe_vote_refusal_is_skipped_but_other_failures_stay_fatal() {
+        // A replica refusing to cast both first-round votes in one view is the
+        // TD-022 safety rule working, and under a slow round it happens
         // routinely: the round times out, then a delayed proposal arrives.
-        // Treating it as a local fault killed the coordinator outright, so a
-        // merely slow validator removed itself from the network.
         assert!(
-            super::skip_when_view_already_timed_out(Err(
-                super::ConsensusError::ConflictingFirstRoundVote
-            ))
-            .expect("a timed-out view must skip its order vote, not fail")
-            .is_none()
+            super::skip_safe_vote_refusal(Err(super::ConsensusError::ConflictingFirstRoundVote))
+                .expect("a timed-out view must skip its order vote, not fail")
+                .is_none()
         );
 
-        // Every other consensus failure must still be fatal.
+        // A replica declining to sign a second, different vote for one
+        // height/view is the equivocation guard working. It legitimately fires
+        // after a restart, when a leader rebuilds a different block at a
+        // height/view it already voted on (INC-003). It must be skipped, never
+        // fatal — propagating it crashed the coordinator and, under fault churn,
+        // cost the network its quorum.
         assert!(
-            super::skip_when_view_already_timed_out(Err(super::ConsensusError::LocalDoubleVote))
+            super::skip_safe_vote_refusal(Err(super::ConsensusError::LocalDoubleVote))
+                .expect("a double-vote refusal must be skipped, not fail")
+                .is_none()
+        );
+
+        // Genuine consensus faults must still be fatal.
+        assert!(
+            super::skip_safe_vote_refusal(Err(super::ConsensusError::CertificateRoundMismatch))
                 .is_err()
         );
     }

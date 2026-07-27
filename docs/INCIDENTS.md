@@ -216,3 +216,99 @@ to a stop height: a quorum is always live for the late validator to trigger on
 and fetch from, on any hardware. The assertion became "the late validator reached
 at least the stop height", since a single catch-up batch can carry it several
 heights past the quorum in one step.
+
+---
+
+## INC-003 — A restarted leader crashed on its own equivocation guard
+
+- **Severity:** Critical (a validator that restarts at a height it led crashes
+  its consensus coordinator; under fault churn this cost the network its quorum).
+- **Component:** `crates/node/src/coordinator.rs` (`ConsensusCoordinator`), at the
+  boundary with `consensus::Replica`'s vote signing.
+- **Status:** Fixed.
+
+### Symptom
+
+A validator that was restarted (crash, upgrade, or fault-injection kill) while it
+was the leader for its current height would immediately stop its consensus
+coordinator on restart:
+
+```
+ERROR consensus coordinator stopped: honest replica refused to double vote
+```
+
+Restarting it again just reproduced the crash, because the cause was in its own
+persisted state. With a second validator also faulted (an ordinary occurrence
+under real churn), losing this one dropped the network below quorum and it
+stopped finalizing.
+
+### Root cause
+
+The same class as INC-001/INC-002: a *correct, expected* safety refusal treated
+as a fatal error.
+
+`Replica::sign_once` returns `LocalDoubleVote` when the replica is asked to sign
+a second, *different* vote at one (height, view, phase) — the equivocation guard.
+A leader legitimately trips this across a restart:
+
+1. As leader of `(H, 0)` it builds a block, signs its own order vote for it, and
+   persists the vote. The in-memory proposal is not persisted.
+2. It restarts. It reloads the persisted vote for `(H, 0, Order) = block_A` but
+   has lost the proposal, and is still the leader of `(H, 0)`.
+3. Its mempool has changed meanwhile, so it rebuilds a *different* block `block_B`
+   for `(H, 0)` and tries to self-vote — `block_B != block_A` ⇒ `LocalDoubleVote`.
+
+The coordinator's `skip_safe_vote_refusal` helper already reclassified the
+sibling refusal `ConflictingFirstRoundVote` as a skip, but deliberately kept
+`LocalDoubleVote` fatal on the assumption it "could not happen honestly." The
+restart-reproposal path above is exactly how it happens honestly.
+
+### Detection
+
+Found by the local chaos-soak harness (`devnet/soak.sh`): four real release-build
+validators under continuous transaction load with wall-clock fault churn
+(kill/isolate/shred-drop/gossip-delay/consensus-drop), asserting safety (no two
+nodes finalize different blocks at one height), liveness (the tip keeps
+advancing), and no-crash (a node meant to be up never exits). A `kill` fault on a
+current leader reproduced the crash on the first fault; a node-level inbound trace
+confirmed the crash fired on the leader's *self*-vote for a rebuilt proposal.
+
+### Fix
+
+Reclassify `LocalDoubleVote` as a safe skip (return no vote, log a warning),
+alongside `ConflictingFirstRoundVote`. Refusing to cast the vote is the safe
+action, and it fires on the leader's self-vote *before* the rebuilt proposal is
+broadcast — so skipping also stops the leader from equivocating on the wire. The
+node keeps running and advances that height by catching up instead of crashing.
+Genuine consensus faults (`CertificateRoundMismatch`, `SafetyViolation`, …) stay
+fatal.
+
+### Regression guards
+
+- `node`: `a_safe_vote_refusal_is_skipped_but_other_failures_stay_fatal` — both
+  `ConflictingFirstRoundVote` and `LocalDoubleVote` are skipped (return
+  `Ok(None)`); a genuine fault still returns `Err`.
+- Behavioural: the soak no longer produces any `refused to double vote` /
+  `coordinator stopped` crash; the refusals now appear as the expected
+  `declined to sign a second, different vote …` warning and the node stays up.
+
+### Systematic audit for siblings
+
+The two first-round-vote refusals (`ConflictingFirstRoundVote`, `LocalDoubleVote`)
+are now both handled as safe skips at the two `vote_for_proposal` call sites.
+Every other `ConsensusError` reaching the coordinator stays fatal, which is
+correct: `SafetyViolation`, `CertificateRoundMismatch`, and `HeightOverflow`
+represent genuine invariant breaks, not routine refusals.
+
+### Known follow-on (not fixed here)
+
+Fixing the crash exposed the *next* layer, which the soak also surfaced and which
+is tracked as recovery work under TD-012, not resolved here: a validator that
+falls behind under load does not reliably *complete* catch-up. Its consensus
+coordinator catches up on finalized orders, but the execution pipeline cannot
+execute them without the corresponding `KestrelCast` payloads, and payload repair
+does not reliably recover them during a catch-up burst — so the INC-002 progress
+guard eventually (and correctly) stops the node. Separately, a behind leader
+re-proposes its stale height every tick (now skipped, not fatal) instead of
+transitioning cleanly to catching up. These are catch-up/state-sync robustness
+gaps, not new fatal-classification bugs.
