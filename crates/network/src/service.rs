@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use futures::StreamExt;
 use libp2p::{
@@ -11,13 +11,27 @@ use libp2p::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
+use tokio::{
+    sync::mpsc,
+    task::JoinHandle,
+    time::{MissedTickBehavior, interval, sleep},
+};
+use tracing::debug;
 use types::Hash;
 
 use crate::Shred;
 
 const TRANSACTION_TOPIC: &str = "kestrel/transactions/1";
 const SHRED_PROTOCOL: &str = "/kestrel/shreds/1";
+/// Caps request-response streams opened by this node at once. Shred propagation
+/// and payload repair share one libp2p behaviour; without a bound, repairing a
+/// batch of heights can expand into hundreds of simultaneous per-shred streams,
+/// exceed the remote handler's capacity, and permanently lose some repairs.
+const MAX_OUTBOUND_SHRED_REQUESTS: usize = 32;
+/// Configured validators are permanent peers, not best-effort discovery
+/// hints. Retry failed startup dials at a bounded cadence: processes commonly
+/// start concurrently and a one-shot dial can race the remote listener.
+const CONFIGURED_PEER_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Validator peer with a stable libp2p identity and dial address.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -302,6 +316,7 @@ impl NetworkNode {
             RunConfig {
                 shred_max_bytes: config.shred_max_bytes,
                 faults: config.faults,
+                configured_peers: config.configured_peers.clone(),
             },
         ));
         Ok(Self {
@@ -390,6 +405,7 @@ impl Behaviour {
 struct RunConfig {
     shred_max_bytes: usize,
     faults: NetworkFaults,
+    configured_peers: Vec<ConfiguredPeer>,
 }
 
 /// The loop's inbound publication points, grouped to keep `run` within bounds.
@@ -417,13 +433,21 @@ async fn run(
     let RunConfig {
         shred_max_bytes,
         faults,
+        configured_peers,
     } = config;
     let transaction_topic = IdentTopic::new(TRANSACTION_TOPIC);
     let local_bytes = swarm.local_peer_id().to_bytes();
     let started = std::time::Instant::now();
+    let mut outbound_shred_requests = HashSet::new();
+    // Hold the head publication until at least one subscribed peer can accept
+    // it. Leaving it in the bounded ingress pipeline applies backpressure to
+    // later submissions instead of acknowledging and silently dropping them.
+    let mut pending_transaction = None;
+    let mut peer_retry = interval(CONFIGURED_PEER_RETRY_INTERVAL);
+    peer_retry.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
         tokio::select! {
-            Some(transaction) = transaction_receiver.recv() => {
+            Some(transaction) = transaction_receiver.recv(), if pending_transaction.is_none() => {
                 if deterministic_drop(
                     faults.transaction_drop_basis_points,
                     &[&local_bytes, &transaction],
@@ -433,9 +457,63 @@ async fn run(
                 if !faults.outbound_delay.is_zero() {
                     sleep(faults.outbound_delay).await;
                 }
-                let _ = swarm.behaviour_mut().transaction_gossip.publish(transaction_topic.clone(), transaction);
+                let retry = transaction.clone();
+                if let Err(error) = swarm
+                    .behaviour_mut()
+                    .transaction_gossip
+                    .publish(transaction_topic.clone(), transaction)
+                {
+                    debug!(%error, "could not publish queued transaction");
+                    if matches!(
+                        error,
+                        gossipsub::PublishError::NoPeersSubscribedToTopic
+                            | gossipsub::PublishError::AllQueuesFull(_)
+                    ) {
+                        pending_transaction = Some(retry);
+                    }
+                }
             }
-            Some((peer, shred, relay_requested)) = shred_receiver.recv() => {
+            _ = peer_retry.tick() => {
+                // `NetworkNode::spawn` performs an eager dial, but the remote
+                // validator may not have started listening yet. A configured
+                // topology must heal that startup race without relying on
+                // mDNS or on the remote side happening to dial us.
+                for configured in &configured_peers {
+                    if configured.peer_id != *swarm.local_peer_id()
+                        && !swarm.is_connected(&configured.peer_id)
+                    {
+                        let _ = swarm.dial(
+                            configured
+                                .address
+                                .clone()
+                                .with(libp2p::multiaddr::Protocol::P2p(configured.peer_id)),
+                        );
+                    }
+                }
+                if let Some(transaction) = pending_transaction.take() {
+                    let retry = transaction.clone();
+                    match swarm
+                        .behaviour_mut()
+                        .transaction_gossip
+                        .publish(transaction_topic.clone(), transaction)
+                    {
+                        Ok(_) | Err(gossipsub::PublishError::Duplicate) => {}
+                        Err(error @ (
+                            gossipsub::PublishError::NoPeersSubscribedToTopic
+                            | gossipsub::PublishError::AllQueuesFull(_)
+                        )) => {
+                            debug!(%error, "queued transaction is still waiting for a gossip peer");
+                            pending_transaction = Some(retry);
+                        }
+                        Err(error) => {
+                            debug!(%error, "queued transaction publication failed permanently");
+                        }
+                    }
+                }
+            }
+            Some((peer, shred, relay_requested)) = shred_receiver.recv(),
+                if outbound_shred_requests.len() < MAX_OUTBOUND_SHRED_REQUESTS =>
+            {
                 if started.elapsed() < faults.shred_outage
                     || deterministic_drop(
                         faults.shred_drop_basis_points,
@@ -447,16 +525,20 @@ async fn run(
                 if !faults.outbound_delay.is_zero() {
                     sleep(faults.outbound_delay).await;
                 }
-                swarm.behaviour_mut().shred_exchange.send_request(
+                let request_id = swarm.behaviour_mut().shred_exchange.send_request(
                     &peer,
                     ShredRequest::Deliver { shred, relay_requested },
                 );
+                outbound_shred_requests.insert(request_id);
             }
-            Some((peer, height)) = repair_receiver.recv() => {
-                swarm
+            Some((peer, height)) = repair_receiver.recv(),
+                if outbound_shred_requests.len() < MAX_OUTBOUND_SHRED_REQUESTS =>
+            {
+                let request_id = swarm
                     .behaviour_mut()
                     .shred_exchange
                     .send_request(&peer, ShredRequest::RepairPayload { height });
+                outbound_shred_requests.insert(request_id);
             }
             Some(peer) = ban_receiver.recv() => {
                 swarm.behaviour_mut().block_list.block_peer(peer);
@@ -483,28 +565,49 @@ async fn run(
                 SwarmEvent::Behaviour(BehaviourEvent::ShredExchange(
                     request_response::Event::Message {
                         peer,
-                        message: request_response::Message::Request { request, channel, .. },
+                        message,
                         ..
                     }
                 )) => {
-                    match request {
-                        ShredRequest::Deliver { shred, relay_requested } => {
-                            if shred.payload.len() <= shred_max_bytes {
-                                let _ = inbound_shred_sender.try_send(InboundShred {
-                                    source: peer,
-                                    shred,
-                                    relay_requested,
-                                });
+                    match message {
+                        request_response::Message::Request { request, channel, .. } => {
+                            match request {
+                                ShredRequest::Deliver { shred, relay_requested } => {
+                                    if shred.payload.len() <= shred_max_bytes {
+                                        let _ = inbound_shred_sender.try_send(InboundShred {
+                                            source: peer,
+                                            shred,
+                                            relay_requested,
+                                        });
+                                    }
+                                }
+                                // Only the pipeline maps heights to payloads, so the
+                                // request is handed up rather than answered here. Its
+                                // reply travels back over the ordinary shred path.
+                                ShredRequest::RepairPayload { height } => {
+                                    let _ = inbound_repair_sender.try_send((peer, height));
+                                }
                             }
+                            let _ = swarm
+                                .behaviour_mut()
+                                .shred_exchange
+                                .send_response(channel, ShredResponse);
                         }
-                        // Only the pipeline maps heights to payloads, so the
-                        // request is handed up rather than answered here. Its
-                        // reply travels back over the ordinary shred path.
-                        ShredRequest::RepairPayload { height } => {
-                            let _ = inbound_repair_sender.try_send((peer, height));
+                        request_response::Message::Response { request_id, .. } => {
+                            outbound_shred_requests.remove(&request_id);
                         }
                     }
-                    let _ = swarm.behaviour_mut().shred_exchange.send_response(channel, ShredResponse);
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::ShredExchange(
+                    request_response::Event::OutboundFailure {
+                        peer,
+                        request_id,
+                        error,
+                        ..
+                    }
+                )) => {
+                    outbound_shred_requests.remove(&request_id);
+                    debug!(%peer, %error, "outbound shred or repair request failed");
                 }
                 _ => {}
             },
@@ -704,6 +807,112 @@ mod tests {
 
         first.task.abort();
         second.task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn configured_peer_startup_race_redials_and_preserves_queued_transaction() {
+        let sender_port = reserve_port();
+        let receiver_port = reserve_port();
+        let sender_identity = libp2p::identity::Keypair::generate_ed25519();
+        let sender_peer = sender_identity.public().to_peer_id();
+        let receiver_identity = libp2p::identity::Keypair::generate_ed25519();
+        let receiver_peer = receiver_identity.public().to_peer_id();
+
+        // Start the sender first, while its configured peer's address refuses
+        // connections. The eager dial and first gossipsub publish both fail in
+        // this window. The network task must retain the accepted publication
+        // and redial; the later peer deliberately does not dial back.
+        let sender = NetworkNode::spawn(
+            sender_identity,
+            GossipConfig {
+                listen_address: format!("/ip4/127.0.0.1/tcp/{sender_port}").parse().unwrap(),
+                configured_peers: vec![ConfiguredPeer {
+                    peer_id: receiver_peer,
+                    address: format!("/ip4/127.0.0.1/tcp/{receiver_port}")
+                        .parse()
+                        .unwrap(),
+                }],
+                heartbeat_interval: Duration::from_millis(25),
+                ..GossipConfig::default()
+            },
+        )
+        .unwrap();
+        sender
+            .handle
+            .try_publish_transaction(b"accepted-before-peer-startup".to_vec())
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let mut receiver = NetworkNode::spawn(
+            receiver_identity,
+            GossipConfig {
+                listen_address: format!("/ip4/127.0.0.1/tcp/{receiver_port}")
+                    .parse()
+                    .unwrap(),
+                // No configured sender: delivery proves the first node retried
+                // its failed dial rather than the late node rescuing the test.
+                configured_peers: Vec::new(),
+                heartbeat_interval: Duration::from_millis(25),
+                ..GossipConfig::default()
+            },
+        )
+        .unwrap();
+
+        let inbound = tokio::time::timeout(DELIVERY_BOUND, receiver.inbound_transactions.recv())
+            .await
+            .expect("the early node never redialed its configured peer")
+            .expect("the late peer's transaction channel closed");
+        assert_eq!(inbound.source, Some(sender_peer));
+        assert_eq!(inbound.bytes, b"accepted-before-peer-startup");
+
+        sender.task.abort();
+        receiver.task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repair_sized_shred_burst_is_flow_controlled_without_loss() {
+        // A catch-up repair can enqueue many heights at once, each expanding to
+        // multiple shreds. Before outbound request flow control, the network
+        // loop opened every stream immediately; libp2p dropped streams above
+        // the remote handler's capacity and the repaired validator remained
+        // stuck forever. This burst is deliberately well above that capacity.
+        const SHRED_COUNT: u16 = 256;
+        let (mut receiver, sender) = configured_pair(NetworkFaults::default()).await;
+        for index in 0..SHRED_COUNT {
+            sender
+                .handle
+                .try_send_shred(
+                    receiver.local_peer_id,
+                    Shred {
+                        block_id: Hash::digest(b"flow-controlled-repair-burst"),
+                        index,
+                        data_shards: SHRED_COUNT,
+                        parity_shards: 1,
+                        original_len: u64::from(SHRED_COUNT),
+                        payload: vec![u8::try_from(index % 251).unwrap()],
+                    },
+                )
+                .unwrap();
+        }
+
+        let delivered = tokio::time::timeout(DELIVERY_BOUND, async {
+            let mut indexes = std::collections::BTreeSet::new();
+            while indexes.len() < usize::from(SHRED_COUNT) {
+                let inbound = receiver
+                    .inbound_shreds
+                    .recv()
+                    .await
+                    .expect("the receiver network task must stay alive");
+                indexes.insert(inbound.shred.index);
+            }
+            indexes
+        })
+        .await
+        .expect("the bounded request window must eventually drain the whole burst");
+        assert_eq!(delivered.len(), usize::from(SHRED_COUNT));
+
+        receiver.task.abort();
+        sender.task.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

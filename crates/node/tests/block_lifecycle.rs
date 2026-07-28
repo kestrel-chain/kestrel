@@ -141,6 +141,50 @@ fn reconstructed_signed_block_executes_commits_and_restores_after_restart() {
 }
 
 #[test]
+fn an_older_execution_commit_does_not_split_the_rpc_finalized_pair() {
+    let directory = TempDir::new().unwrap();
+    let (genesis, validator_keys) = genesis(Vec::new());
+    let validated = genesis.validate().unwrap();
+    let status = status(&genesis, validated.genesis_hash, validated.state_root);
+    let shared_state = Arc::new(RwLock::new(StateTree::new(StateConfig::default()).unwrap()));
+    let mut lifecycle = BlockLifecycle::open(
+        &genesis,
+        directory.path(),
+        Arc::clone(&status),
+        shared_state,
+        100,
+        1,
+    )
+    .unwrap();
+    let payload = PropagatedBlock {
+        height: 1,
+        parent_id: validated.genesis_hash,
+        transactions: Vec::new(),
+        base_fees: Vec::new(),
+    };
+    lifecycle
+        .submit_payload(
+            finalized_order(&genesis, &validator_keys, &payload),
+            &payload,
+        )
+        .unwrap();
+
+    let newer_finalized_block = Hash::digest(b"coordinator-finalized-height-7");
+    {
+        let mut current = status.write().unwrap();
+        current.finalized_height = 7;
+        current.finalized_block = newer_finalized_block;
+    }
+    let committed = wait_for_commit(&mut lifecycle);
+    assert_eq!(committed.height, 1);
+
+    let current = status.read().unwrap();
+    assert_eq!(current.committed_height, 1);
+    assert_eq!(current.finalized_height, 7);
+    assert_eq!(current.finalized_block, newer_finalized_block);
+}
+
+#[test]
 fn rent_epoch_advances_automatically_and_survives_restart() {
     let directory = TempDir::new().unwrap();
     let owner = Address::from_bytes([0x2a; 32]);
@@ -291,6 +335,11 @@ fn finalized_block_submitted_before_a_crash_still_commits_after_restart() {
     )
     .unwrap();
     assert_eq!(lifecycle.committed_height(), 0);
+    assert_eq!(
+        lifecycle.submitted_height(),
+        1,
+        "startup must expose the durable pending block already replayed into execution"
+    );
     let record = wait_for_commit(&mut lifecycle);
     assert_eq!(record.height, 1);
     assert_eq!(lifecycle.committed_height(), 1);

@@ -115,11 +115,19 @@ Priority meanings:
   and shred sends, with 100% shred loss modelling a dead relay. Direct
   two-node-swarm tests confirm each knob actually degrades delivery and are
   verified non-vacuous (a control with faults disabled still delivers, and
-  neutralising the fault application makes all three fault tests fail). Still
-  outstanding: this has only run on one machine over loopback for seconds at a
-  time; nobody has run the network under those injected conditions across real
-  machines/geography, and nobody has measured propagation-to-80%-stake or
-  end-to-end finality under them.
+  neutralising the fault application makes all three fault tests fail).
+  Provider-neutral campaign evidence tooling now exists:
+  `stage2_campaign_monitor.py` continuously checks remote RPC identity,
+  safety, and bounded liveness without exposing a mutation endpoint, while
+  `stage2_campaign_report.py` hashes validator logs and derives
+  stake-threshold propagation, finality, cross-validator skew, view-change,
+  execution-lag, fatal-task, and malformed/incomplete-evidence gates. The
+  production finalization event now includes its measured `latency_ms`, and
+  the operator runbook requires clock-skew evidence before correlating
+  admission timestamps across hosts. Still outstanding: this has only run on
+  one machine over loopback; nobody has run the network under those injected
+  conditions across real machines/geography, and no external
+  propagation-to-80%-stake or end-to-end finality result exists yet.
 - **Expected resolution:** Run a real Stage 2 private devnet (external of this
   workspace's automated tests) across real machines/geography, driving it with
   the libp2p-path and raw-TCP fault injection now available, and record
@@ -218,10 +226,25 @@ Priority meanings:
   the network resending a block the node already validated. Covered by
   `finalized_block_submitted_before_a_crash_still_commits_after_restart` in
   `crates/node/tests/block_lifecycle.rs`, verified to fail without the fix.
-  There is still no authenticated snapshot transfer to a late-joining node, no
-  cross-network state-sync protocol, and no pruning policy — these are
-  materially larger, riskier features than the two recovery gaps just closed
-  and remain open design questions rather than narrow bugs.
+  Bounded validator catch-up is now reliable as well: finalized orders and
+  their payloads have matching 1,024-height durable retention windows; repair
+  requests cover 32 missing heights per round, rotate across peers when the
+  head payload's holder is unknown, and outbound shred/repair streams are
+  capped at 32 so libp2p backpressure does not silently discard a catch-up
+  burst. Restart preserves both the pipeline's submitted cursor and a leader's
+  exact unsubmitted proposal identity. Consensus continues its pacemaker when
+  that pipeline is temporarily not proposal-ready, timeout votes can be
+  aggregated by any admitted validator rather than only a potentially lagging
+  next leader, and signed order votes are retransmitted until certified.
+  Recovery regressions cover a 48-block payload gap, proposal/payload
+  persistence, an absent next-view leader, and an execution commit lagging
+  behind the RPC finalized position. Diagnostic release-binary soaks exercised
+  restart, shred-drop, gossip-delay, isolation, and consensus-drop churn under
+  continuous transactions; the final 120-second run passed at height 755 with
+  no safety/liveness/crash/catch-up violation. There is still no authenticated
+  snapshot transfer to a node outside the retained window, no cross-network
+  state-sync protocol, and no pruning policy — these are materially larger,
+  riskier features and remain open design questions rather than narrow bugs.
 - **Expected resolution:** Design and add authenticated snapshot and
   block-history transfer for late-joining nodes, define a retention/pruning
   policy, define a cross-network state-sync protocol, and measure bootstrap and
@@ -284,8 +307,15 @@ Priority meanings:
 - **Why deferred/exposed:** Discovery is mDNS-only for LAN devnets, but every
   validator's genesis-configured `gossip_peer_id`/`gossip_address` is now dialed
   explicitly as a `ConfiguredPeer` (closed alongside TD-002/TD-003) — bootstrap
-  no longer depends on mDNS for the validator set itself. `network::NetworkHandle`
-  now exposes `ban_peer`, backed by a real `libp2p::allow_block_list::Behaviour`:
+  no longer depends on mDNS for the validator set itself. Configured connections
+  now retry every 250 ms when an eager startup dial races a peer's listener,
+  rather than remaining disconnected forever. A transaction accepted into the
+  network queue while no gossip peer is subscribed is retained at the bounded
+  queue head and retried instead of being silently discarded; a deterministic
+  late-peer test covers both properties, and the real four-process submission
+  test passed 20/20 post-fix repetitions (INC-004).
+  `network::NetworkHandle` now exposes `ban_peer`, backed by a real
+  `libp2p::allow_block_list::Behaviour`:
   banning a peer closes its live connection immediately and blocks all future
   connections in both directions (tested directly: a real two-node swarm, ban,
   then confirm the connection drops and its messages never arrive again — and
@@ -396,17 +426,40 @@ Priority meanings:
 
 ### TD-019 — RPC and operations need production hardening
 
-- **Priority:** High for public deployment.
+- **Priority:** High for public deployment; narrowed. The in-process public
+  surface has bounded bodies and batches, per-source call accounting, and
+  explicit public-bind acknowledgement, while deployment-edge controls and
+  production load evidence remain outstanding.
 - **Introduced:** Phase 6 explicit deferral. Exact commit unavailable. Source:
   `phase-6-status.md`.
-- **Why deferred:** TLS termination, distributed denial-of-service controls,
-  archival/indexer APIs, gRPC/WebSocket surfaces, production load tests, and a
-  concrete authorized cloud/Kubernetes chaos adapter live outside the current
-  local code-readiness pass.
+- **Why deferred/exposed:** TLS termination, distributed denial-of-service
+  controls, archival/indexer APIs, gRPC/WebSocket surfaces, production load
+  tests, and a concrete authorized cloud/Kubernetes chaos adapter live outside
+  the current local code-readiness pass. The existing per-source fixed-window
+  limiter previously charged one unit per HTTP envelope, which let a client
+  multiply its effective allowance by placing up to 64 JSON-RPC calls in each
+  permitted batch. It now charges every batch element independently (while
+  malformed and over-limit envelopes still consume one unit), and regression
+  coverage proves a two-call batch plus one single call exhausts a three-call
+  window. Batch-contained JSON-RPC errors are also included in the exported
+  error counter rather than being missed because only top-level error objects
+  were inspected. A provider-neutral, read-only load/abuse harness now applies
+  open-loop concurrent status traffic, batch-aware accounting, partial-body
+  slow clients, malformed/oversized inputs, deterministic limiter exhaustion,
+  latency/error gates, and Prometheus counter-delta checks; it refuses
+  non-loopback targets without explicit acknowledgement and writes immutable
+  JSON evidence. Its real-node smoke run passed 200/200 calls at an offered
+  100 calls/s with 111.8 ms p95 on this development host, all five abuse probes
+  passing, and exact metric deltas (227 handled requests, two JSON-RPC errors,
+  two rejections). This is tooling validation and local smoke evidence, not a
+  production capacity result. Sustained multi-rate tests behind the intended
+  TLS/edge topology, resource telemetry, and production alert thresholds remain
+  outstanding.
 - **Expected resolution:** Define deployment architecture and trust boundaries,
-  load/abuse-test RPC, add required subscription/indexing APIs, connect metrics
-  and alerts, and implement narrowly scoped external chaos controls in the
-  deployment repository.
+  run sustained multi-rate load/abuse campaigns through the production edge
+  while capturing CPU/memory/socket telemetry, add required
+  subscription/indexing APIs, connect metrics and alerts, and implement narrowly
+  scoped external chaos controls in the deployment repository.
 
 ### TD-020 — Public-testnet Stages 2–5 remain unpassed
 

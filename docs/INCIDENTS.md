@@ -300,15 +300,75 @@ Every other `ConsensusError` reaching the coordinator stays fatal, which is
 correct: `SafetyViolation`, `CertificateRoundMismatch`, and `HeightOverflow`
 represent genuine invariant breaks, not routine refusals.
 
-### Known follow-on (not fixed here)
+### Follow-on recovery work
 
-Fixing the crash exposed the *next* layer, which the soak also surfaced and which
-is tracked as recovery work under TD-012, not resolved here: a validator that
-falls behind under load does not reliably *complete* catch-up. Its consensus
-coordinator catches up on finalized orders, but the execution pipeline cannot
-execute them without the corresponding `KestrelCast` payloads, and payload repair
-does not reliably recover them during a catch-up burst — so the INC-002 progress
-guard eventually (and correctly) stops the node. Separately, a behind leader
-re-proposes its stale height every tick (now skipped, not fatal) instead of
-transitioning cleanly to catching up. These are catch-up/state-sync robustness
-gaps, not new fatal-classification bugs.
+The bounded catch-up failure exposed here was subsequently fixed under TD-012:
+finalized orders and payloads now share a durable retention window, batched
+repair is flow-controlled and rotates across possible holders, restart restores
+the submitted cursor and exact leader proposal, the pacemaker continues while a
+pipeline is temporarily not proposal-ready, timeout aggregation no longer
+depends on a lagging scheduled leader, and already-signed order votes are
+retransmitted until certified. A release-binary disruption soak now passes.
+Authenticated snapshot/state transfer for a node outside the retained history
+window remains open under TD-012.
+
+---
+
+## INC-004 — One-shot gossip startup lost accepted transactions
+
+- **Severity:** High (an RPC submission could be acknowledged locally while
+  other validators never received it; consensus could continue while their
+  application state remained behind the submitting validator).
+- **Component:** `crates/network/src/service.rs` (`NetworkNode` configured-peer
+  bootstrap and transaction publication).
+- **Status:** Fixed.
+
+### Symptom
+
+The four-process production-path test intermittently committed an
+RPC-submitted transaction on only one of four validators. Consensus remained
+live and finalized through height 98, but the other three validators never
+executed the certified transaction. An immediate repeat passed in 3.63 seconds,
+making this a startup race rather than a deterministic steady-state failure.
+
+### Root cause
+
+Configured libp2p validators were dialed exactly once during
+`NetworkNode::spawn`. If that eager dial raced the remote process's listener,
+the connection failed and was never retried; mDNS added peers to gossipsub but
+did not repair the configured transport connection. At the same time,
+`try_publish_transaction` acknowledged that a transaction entered the bounded
+local channel, but the network task discarded gossipsub's
+`NoPeersSubscribedToTopic`/`AllQueuesFull` result. Thus a transaction accepted
+during startup could lose its only publication attempt.
+
+### Fix
+
+The network task now redials every disconnected configured peer at a bounded
+250 ms cadence. It also retains the head transaction when gossipsub has no
+subscribed peer or all peer queues are full, retrying it on the same cadence.
+Only one publication is held outside the existing bounded ingress channel, so
+later RPC submissions naturally encounter backpressure instead of creating an
+unbounded retry buffer. Permanent publication errors remain logged and are not
+retried.
+
+Shred and repair outbound failures, payload reconstruction, unavailable repair
+payloads, and failed transaction publications now emit focused diagnostic
+events, so any future convergence failure distinguishes connectivity,
+propagation, reconstruction, and execution without dumping unrelated traces.
+
+### Regression guards
+
+- `network`:
+  `configured_peer_startup_race_redials_and_preserves_queued_transaction`
+  starts the sender before its configured peer exists, queues a transaction
+  while both the eager dial and first publication fail, then starts a peer that
+  deliberately does not dial back. Delivery proves both redial and publication
+  retention are active.
+- `network`: all 13 tests pass, including configured-peer transaction/shred
+  delivery, repair-burst flow control, delay/drop faults, and durable bans.
+- `node`: the four-process RPC submission test passed 20/20 fresh post-fix
+  repetitions (and 10/10 diagnostic repetitions immediately before the fix);
+  every run committed identically on all four validators in about 3.6 seconds.
+- `node`: the forced 15-second shred-outage regression still recovers a
+  48-block payload backlog from peers, proving the repair path remains intact.

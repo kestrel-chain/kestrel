@@ -176,6 +176,10 @@ fn node_binary_commits_an_rpc_submitted_transaction_across_all_processes() {
                         .filter(|line| {
                             line.contains("admitted transaction")
                                 || line.contains("finalized height")
+                                || line.contains("payload")
+                                || line.contains("shred")
+                                || line.contains("queued transaction")
+                                || line.contains("pipeline stopped")
                                 || (line.contains("transaction_count")
                                     && !line.contains("\"transaction_count\":0"))
                         })

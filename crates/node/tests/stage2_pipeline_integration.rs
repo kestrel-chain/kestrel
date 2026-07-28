@@ -727,7 +727,11 @@ async fn run_concurrent_independent_senders(transaction_count: usize) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[allow(clippy::too_many_lines)]
 async fn a_validator_that_missed_a_payload_recovers_it_from_peers() {
-    const TRANSACTION_COUNT: usize = 4;
+    // One transaction per block below creates more missed heights than one
+    // repair batch. This is intentionally a catch-up backlog, not the old
+    // single-payload happy path.
+    const TRANSACTION_COUNT: usize = 48;
+    let captured = captured_log();
     let directory = TempDir::new().unwrap();
     let senders = (0..TRANSACTION_COUNT)
         .map(|index| {
@@ -811,6 +815,7 @@ async fn a_validator_that_missed_a_payload_recovers_it_from_peers() {
     let mut object_states = Vec::new();
     let mut tasks = Vec::new();
     let mut built = Vec::new();
+    let mut statuses = Vec::new();
     for index in 0..VALIDATOR_COUNT {
         let status = Arc::new(RwLock::new(NodeStatus {
             chain_id: genesis.chain_id.clone(),
@@ -824,6 +829,7 @@ async fn a_validator_that_missed_a_payload_recovers_it_from_peers() {
             finality_latency_ms: None,
             view_changes: 0,
         }));
+        statuses.push(Arc::clone(&status));
         let shared_state = Arc::new(RwLock::new(StateTree::new(StateConfig::default()).unwrap()));
         let lifecycle = BlockLifecycle::open(
             &genesis,
@@ -857,7 +863,7 @@ async fn a_validator_that_missed_a_payload_recovers_it_from_peers() {
                     // from them. This blackout stops any validator that is not
                     // a height's proposer from receiving its payload, which is
                     // precisely what repair has to undo.
-                    shred_outage: Duration::from_secs(3),
+                    shred_outage: Duration::from_secs(15),
                     ..network::NetworkFaults::default()
                 },
                 ..GossipConfig::default()
@@ -872,6 +878,7 @@ async fn a_validator_that_missed_a_payload_recovers_it_from_peers() {
             validator_peers.clone(),
             finalized_order_receiver,
             Stage2PipelineConfig {
+                maximum_block_transactions: 1,
                 payload_repair_delay: Duration::from_millis(200),
                 ..Stage2PipelineConfig::default()
             },
@@ -927,7 +934,7 @@ async fn a_validator_that_missed_a_payload_recovers_it_from_peers() {
             .unwrap();
     }
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
     loop {
         let all_committed = object_states.iter().all(|state| {
             let state = state.read().unwrap();
@@ -940,10 +947,17 @@ async fn a_validator_that_missed_a_payload_recovers_it_from_peers() {
         if all_committed {
             break;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "a validator never recovered a payload it missed, so its execution stayed stuck"
-        );
+        if tokio::time::Instant::now() >= deadline {
+            let statuses = statuses
+                .iter()
+                .map(|status| status.read().unwrap().clone())
+                .collect::<Vec<_>>();
+            panic!(
+                "a validator never recovered a payload it missed, so its execution stayed stuck; \
+                 statuses: {statuses:#?}{}",
+                captured.dump()
+            );
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
@@ -1406,10 +1420,10 @@ async fn malformed_gossiped_transaction_does_not_kill_the_pipeline() {
 /// pipeline's mempool -- unless it is durably logged. This proves it survives
 /// a full drop-and-reopen of the pipeline (standing in for a process crash
 /// and restart): submit a transaction, tear down every component holding the
-/// node's `RocksDB` store without ever running the pipeline (so the
-/// transaction is never proposed or finalized), reopen fresh components at
-/// the same data directory, and confirm the transaction is available to
-/// propose again with no resubmission (see `docs/TECH_DEBT.md` TD-015).
+/// node's `RocksDB` store after building a proposal but before finalization,
+/// reopen fresh components at the same data directory, and confirm both the
+/// admission and exact proposal identity survive with no resubmission. Exact
+/// identity matters because consensus may already have durably voted for it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)] // Keep the full admit/drop/reopen/verify timeline auditable.
 async fn admitted_transaction_survives_a_restart_before_finalization() {
@@ -1485,9 +1499,9 @@ async fn admitted_transaction_survives_a_restart_before_finalization() {
     let data_directory = directory.path().join("app-0");
     let transaction = signed_mutation(&account_key, &account_public_key, owner, 0, &target, 0, 42);
 
-    // First "process": admit the transaction, then tear down without ever
-    // calling `run()` -- nothing gets proposed, ordered, or finalized.
-    {
+    // First "process": admit and build a proposal, then tear down without ever
+    // calling `run()` -- it is never certified or finalized.
+    let proposed_before_restart = {
         let status = Arc::new(RwLock::new(NodeStatus {
             chain_id: genesis.chain_id.clone(),
             genesis_hash: validated.genesis_hash,
@@ -1532,12 +1546,17 @@ async fn admitted_transaction_survives_a_restart_before_finalization() {
         )
         .unwrap();
         handle.submit_transaction(transaction.clone()).unwrap();
+        let proposed = pipeline
+            .proposal_source()
+            .transaction_ids(1, validated.genesis_hash)
+            .expect("the first process builds a proposal before crashing");
         // Drop the pipeline (and, transitively, the lifecycle and its
         // `Arc<RocksDbStore>`) and the handle without ever running either,
         // releasing the RocksDB lock so the same path can be reopened below.
         drop(pipeline);
         drop(handle);
-    }
+        proposed
+    };
 
     // Second "process": reopen at the same data directory. No resubmission.
     let status = Arc::new(RwLock::new(NodeStatus {
@@ -1584,10 +1603,15 @@ async fn admitted_transaction_survives_a_restart_before_finalization() {
     )
     .unwrap();
 
-    let (restored_ids, _fee_commitment) = pipeline
+    let restored = pipeline
         .proposal_source()
         .transaction_ids(1, validated.genesis_hash)
         .expect("the durably re-admitted transaction is available to propose");
+    assert_eq!(
+        restored, proposed_before_restart,
+        "a restarted leader must reproduce the exact proposal identity it may already have voted for"
+    );
+    let (restored_ids, _fee_commitment) = restored;
     assert_eq!(
         restored_ids.len(),
         1,

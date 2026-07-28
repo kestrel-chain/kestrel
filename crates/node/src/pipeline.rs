@@ -188,6 +188,10 @@ pub struct Stage2Pipeline {
     /// the current backoff between asks. Cleared whenever a height is submitted.
     repair_after: Option<Instant>,
     repair_backoff: Duration,
+    /// Starting peer for the next repair attempt. Rotating this prevents a
+    /// missing head payload from being requested forever from one peer that
+    /// also missed it.
+    repair_peer_cursor: usize,
     /// Highest `submitted_height` seen the last time the backlog was checked.
     /// Any advance past it proves execution is still draining the backlog and
     /// resets the stall clock.
@@ -263,7 +267,11 @@ impl Stage2Pipeline {
                 payloads: BTreeMap::new(),
                 shreds: BTreeMap::new(),
                 propagated: BTreeSet::new(),
-                retired_height: lifecycle.committed_height(),
+                // A durable pending block is replayed into execution by
+                // `BlockLifecycle::open`. It is already canonical and its
+                // transactions must not be selected again even though it has
+                // not reached the committed checkpoint yet.
+                retired_height: lifecycle.submitted_height(),
                 shreds_received: 0,
                 payloads_reconstructed: 0,
                 shred_arrivals: BTreeMap::new(),
@@ -303,7 +311,11 @@ impl Stage2Pipeline {
             network: network_node.handle.clone(),
         };
         let peer_ids = source.validator_peers.values().copied().collect();
-        let submitted_height = lifecycle.committed_height();
+        // Includes a finalized-but-not-yet-committed block restored from the
+        // lifecycle's durable pending log. Starting from committed height here
+        // made the pipeline wait forever to re-fetch and re-submit a height the
+        // lifecycle was already executing after restart.
+        let submitted_height = lifecycle.submitted_height();
         Ok((
             Self {
                 source,
@@ -323,6 +335,7 @@ impl Stage2Pipeline {
                 inbound_repair_requests: network_node.inbound_repair_requests,
                 repair_after: None,
                 repair_backoff: config.payload_repair_delay,
+                repair_peer_cursor: 0,
                 progress_height: submitted_height,
                 stalled_since: None,
             },
@@ -374,7 +387,14 @@ impl Stage2Pipeline {
                     }
                 }
                 Some(order) = self.finalized_orders.recv() => {
-                    self.pending_orders.insert(order.height, order);
+                    // Consensus and application recovery are independent. A
+                    // coordinator can replay an order that the lifecycle has
+                    // already restored from its own durable pending log; it is
+                    // idempotent at this boundary and must not re-enter the
+                    // payload-repair queue.
+                    if order.height > self.submitted_height {
+                        self.pending_orders.insert(order.height, order);
+                    }
                     // Drain first: a backlog that clears is ordinary deferred
                     // execution, not a fault. Only a backlog that both exceeds
                     // the bound and stays frozen counts as a stall.
@@ -452,6 +472,7 @@ impl Stage2Pipeline {
     /// by height and resolved against the payloads held here.
     fn serve_payload_repair(&self, peer: PeerId, height: u64) -> Result<(), PipelineError> {
         let Some(payload) = self.source.payload_at_height(height)? else {
+            trace!(%peer, height, "requested repair payload is unavailable");
             return Ok(());
         };
         for shred in payload.shreds(self.config.kestrel_cast)? {
@@ -463,12 +484,19 @@ impl Stage2Pipeline {
         Ok(())
     }
 
-    /// Asks peers for the payload this validator is stuck on, once it has
-    /// clearly not arrived by itself, then backs off so a genuinely
-    /// unavailable payload cannot generate unbounded traffic.
+    /// Asks peers for the payloads this validator is stuck on, once they have
+    /// clearly not arrived by themselves, then backs off so genuinely
+    /// unavailable payloads cannot generate unbounded traffic.
+    ///
+    /// It requests a *batch* of upcoming certified heights, not just the head:
+    /// a validator catching up from far behind must pull missing blocks faster
+    /// than the chain produces them, or it never converges. The backoff still
+    /// bounds traffic when nothing is arriving, but every successful submission
+    /// resets it (see `submit_available_orders`), so an actively converging
+    /// validator keeps requesting at the base cadence rather than backing off.
     fn request_payload_repair_if_stuck(&mut self) {
-        let height = self.submitted_height.saturating_add(1);
-        if !self.pending_orders.contains_key(&height) {
+        let head = self.submitted_height.saturating_add(1);
+        if !self.pending_orders.contains_key(&head) {
             // Nothing certified is waiting, so nothing is missing.
             self.repair_after = None;
             self.repair_backoff = self.config.payload_repair_delay;
@@ -482,19 +510,34 @@ impl Stage2Pipeline {
         if now < deadline {
             return;
         }
-        for peer in self
+        let peers = self
             .peer_ids
             .iter()
             .copied()
             .filter(|peer| *peer != self.local_peer_id)
-        {
-            if let Err(error) = self.network.try_request_payload(peer, height) {
-                debug!(%peer, height, %error, "could not queue a payload repair request");
+            .collect::<Vec<_>>();
+        if peers.is_empty() {
+            return;
+        }
+        // The next contiguous certified heights we cannot yet execute. Spread
+        // across peers round-robin so no single one serves the whole batch.
+        let wanted = self
+            .pending_orders
+            .range(head..)
+            .take(PAYLOAD_REPAIR_BATCH)
+            .map(|(height, _)| *height)
+            .collect::<Vec<_>>();
+        for (index, height) in wanted.iter().enumerate() {
+            let peer = peers[rotating_peer_index(self.repair_peer_cursor, index, peers.len())];
+            if let Err(error) = self.network.try_request_payload(peer, *height) {
+                debug!(%peer, height = *height, %error, "could not queue a payload repair request");
             }
         }
+        self.repair_peer_cursor = (self.repair_peer_cursor + 1) % peers.len();
         warn!(
-            height,
-            "certified payload has not arrived; asking peers to resend it"
+            from_height = head,
+            count = wanted.len(),
+            "certified payloads have not arrived; asking peers to resend them"
         );
         self.repair_backoff = self
             .repair_backoff
@@ -723,12 +766,50 @@ struct PipelineProposalSource {
 
 const ADMISSION_KEY_PREFIX: &[u8] = b"pipeline/admission/pending/";
 const BAN_KEY_PREFIX: &[u8] = b"pipeline/ban/v1/";
-/// Executed heights whose payloads stay available to answer repair requests.
+/// A leader's deterministic proposal for `(height, parent)`. This must outlive
+/// a crash once the consensus replica may have durably voted for its block ID:
+/// rebuilding from a changed/reordered mempool can produce a different block,
+/// which the replica correctly refuses to double-vote for, while its earlier
+/// order vote also prevents a timeout vote in that view.
+const PROPOSAL_KEY_PREFIX: &[u8] = b"pipeline/proposal/v1/";
+/// Executed heights whose payloads stay available *in memory* to answer a
+/// repair request on the hot path.
 const RETAINED_PAYLOADS_FOR_REPAIR: usize = 64;
+/// Executed heights whose payloads are retained *durably* so a validator that
+/// fell far behind can fetch and re-execute the blocks it missed. Matches the
+/// consensus catch-up order-retention window (`coordinator::CATCHUP_RETENTION`):
+/// any height the coordinator can replay as a finalized order, some peer can
+/// also serve as a payload, so catch-up does not deliver orders that can never
+/// be executed (INC-002's underlying gap).
+const DURABLE_PAYLOAD_HISTORY: u64 = 1_024;
+const PAYLOAD_HISTORY_KEY_PREFIX: &[u8] = b"pipeline/payload-history/v1/";
+/// How many upcoming missing payloads a lagging validator requests per repair
+/// round instead of one. A validator catching up must pull blocks faster than
+/// the chain produces them or it never converges; kept below
+/// `maximum_inflight_shred_blocks` so a batch's reconstructions all fit.
+const PAYLOAD_REPAIR_BATCH: usize = 32;
+
+fn rotating_peer_index(cursor: usize, batch_index: usize, peer_count: usize) -> usize {
+    debug_assert!(peer_count > 0);
+    (cursor + batch_index) % peer_count
+}
 
 fn admission_key(id: Hash) -> Vec<u8> {
     let mut key = ADMISSION_KEY_PREFIX.to_vec();
     key.extend_from_slice(id.as_bytes());
+    key
+}
+
+fn payload_history_key(height: u64) -> Vec<u8> {
+    let mut key = PAYLOAD_HISTORY_KEY_PREFIX.to_vec();
+    key.extend_from_slice(&height.to_be_bytes());
+    key
+}
+
+fn proposal_key(height: u64, parent_id: Hash) -> Vec<u8> {
+    let mut key = PROPOSAL_KEY_PREFIX.to_vec();
+    key.extend_from_slice(&height.to_be_bytes());
+    key.extend_from_slice(parent_id.as_bytes());
     key
 }
 
@@ -755,6 +836,57 @@ fn persisted_bans(store: &RocksDbStore) -> Result<Vec<PeerId>, PipelineError> {
         }
     }
     Ok(peers)
+}
+
+fn persisted_payload_at_height(
+    store: &RocksDbStore,
+    height: u64,
+) -> Result<Option<PropagatedBlock>, PipelineError> {
+    match store.get(&payload_history_key(height))? {
+        Some(bytes) => {
+            Ok(Some(bcs::from_bytes(&bytes).map_err(|error| {
+                PipelineError::Encoding(error.to_string())
+            })?))
+        }
+        None => Ok(None),
+    }
+}
+
+fn persist_payload_history(
+    store: &RocksDbStore,
+    payload: &PropagatedBlock,
+) -> Result<(), PipelineError> {
+    store.put(
+        &payload_history_key(payload.height),
+        &bcs::to_bytes(payload).map_err(|error| PipelineError::Encoding(error.to_string()))?,
+    )?;
+    if let Some(prune_below) = payload.height.checked_sub(DURABLE_PAYLOAD_HISTORY) {
+        store.delete(&payload_history_key(prune_below))?;
+    }
+    Ok(())
+}
+
+fn persisted_proposal(
+    store: &RocksDbStore,
+    height: u64,
+    parent_id: Hash,
+) -> Result<Option<PropagatedBlock>, PipelineError> {
+    match store.get(&proposal_key(height, parent_id))? {
+        Some(bytes) => {
+            Ok(Some(bcs::from_bytes(&bytes).map_err(|error| {
+                PipelineError::Encoding(error.to_string())
+            })?))
+        }
+        None => Ok(None),
+    }
+}
+
+fn persist_proposal(store: &RocksDbStore, payload: &PropagatedBlock) -> Result<(), PipelineError> {
+    store.put(
+        &proposal_key(payload.height, payload.parent_id),
+        &bcs::to_bytes(payload).map_err(|error| PipelineError::Encoding(error.to_string()))?,
+    )?;
+    Ok(())
 }
 
 impl PipelineProposalSource {
@@ -842,6 +974,10 @@ impl PipelineProposalSource {
         if let Some(payload) = state.payloads.get(&key) {
             return Ok(payload.clone());
         }
+        if let Some(payload) = persisted_proposal(&self.admission_store, height, parent_id)? {
+            state.payloads.insert(key, payload.clone());
+            return Ok(payload);
+        }
         // The consensus coordinator's own height advances the instant a
         // certificate forms, on a separate task from this one — it can ask
         // for height N+1 before this validator's mempool has retired height
@@ -887,6 +1023,11 @@ impl PipelineProposalSource {
             scope_visits = selection.scope_visits,
             "built new block proposal"
         );
+        // Persist before returning transaction IDs to consensus. The caller may
+        // immediately sign and durably record an order vote for this payload's
+        // block ID; after that point losing the payload makes the leader unable
+        // to vote for a rebuilt block or cast a mutually-exclusive timeout.
+        persist_proposal(&self.admission_store, &payload)?;
         state.payloads.insert(key, payload.clone());
         Ok(payload)
     }
@@ -975,6 +1116,12 @@ impl PipelineProposalSource {
         let payload_key = payload.payload_id()?;
         let mut state = self.state.lock().map_err(|_| PipelineError::LockPoisoned)?;
         state.payloads_reconstructed = state.payloads_reconstructed.saturating_add(1);
+        debug!(
+            height = payload.height,
+            block = %payload_key,
+            transaction_count = payload.transactions.len(),
+            "reconstructed payload from shreds"
+        );
         state
             .payloads
             .entry((payload.height, payload_key))
@@ -985,14 +1132,23 @@ impl PipelineProposalSource {
     }
 
     /// Any payload held for `height`, for answering a peer's repair request.
+    /// Checks the in-memory caches first, then falls back to the durable
+    /// block-history so a far-behind peer can be served a height evicted from
+    /// memory but still within the retained window.
     fn payload_at_height(&self, height: u64) -> Result<Option<PropagatedBlock>, PipelineError> {
-        let state = self.state.lock().map_err(|_| PipelineError::LockPoisoned)?;
-        Ok(state
-            .payloads
-            .iter()
-            .find(|((payload_height, _), _)| *payload_height == height)
-            .map(|(_, payload)| payload.clone())
-            .or_else(|| state.recent_payloads.get(&height).cloned()))
+        {
+            let state = self.state.lock().map_err(|_| PipelineError::LockPoisoned)?;
+            if let Some(payload) = state
+                .payloads
+                .iter()
+                .find(|((payload_height, _), _)| *payload_height == height)
+                .map(|(_, payload)| payload.clone())
+                .or_else(|| state.recent_payloads.get(&height).cloned())
+            {
+                return Ok(Some(payload));
+            }
+        }
+        persisted_payload_at_height(&self.admission_store, height)
     }
 
     fn payload_for_order(
@@ -1042,13 +1198,19 @@ impl PipelineProposalSource {
         state
             .recent_payloads
             .insert(payload.height, payload.clone());
-        // Bounded: only enough history for a lagging peer to catch up.
+        // Bounded in-memory hot cache for the common (slightly-behind) case.
         while state.recent_payloads.len() > RETAINED_PAYLOADS_FOR_REPAIR {
             let oldest = state.recent_payloads.keys().next().copied();
             if let Some(oldest) = oldest {
                 state.recent_payloads.remove(&oldest);
             }
         }
+        // Durable, bounded block-history so a validator that fell further behind
+        // than the in-memory cache — or a peer serving one that did — can still
+        // fetch and re-execute the blocks it missed, and survive a restart.
+        persist_payload_history(&self.admission_store, payload)?;
+        self.admission_store
+            .delete(&proposal_key(payload.height, payload.parent_id))?;
         state
             .payloads
             .retain(|(height, _), _| *height > payload.height);
@@ -1198,11 +1360,22 @@ mod tests {
     use libp2p::PeerId;
     use storage::{KvStore, RocksDbStore};
     use tempfile::TempDir;
+    use types::Hash;
 
     use super::{
-        BAN_KEY_PREFIX, PipelineError, is_peer_misbehaviour, persist_ban, persisted_bans,
-        tally_offense,
+        BAN_KEY_PREFIX, DURABLE_PAYLOAD_HISTORY, PipelineError, PropagatedBlock,
+        is_peer_misbehaviour, persist_ban, persist_payload_history, persist_proposal,
+        persisted_bans, persisted_payload_at_height, persisted_proposal, proposal_key,
+        rotating_peer_index, tally_offense,
     };
+
+    #[test]
+    fn a_single_missing_height_rotates_across_repair_peers() {
+        let visited = (0..6)
+            .map(|repair_round| rotating_peer_index(repair_round, 0, 3))
+            .collect::<Vec<_>>();
+        assert_eq!(visited, vec![0, 1, 2, 0, 1, 2]);
+    }
 
     #[test]
     fn a_full_shred_buffer_evicts_the_stalest_group_instead_of_wedging() {
@@ -1378,6 +1551,77 @@ mod tests {
         // The corrupt record was deleted on read, so a second pass returns only
         // the two valid bans and leaves nothing malformed behind.
         assert_eq!(persisted_bans(&store).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn payload_history_survives_restart_and_prunes_to_the_catchup_window() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("store");
+        let last_height = DURABLE_PAYLOAD_HISTORY + 2;
+
+        {
+            let store = RocksDbStore::open(&path).unwrap();
+            for height in 1..=last_height {
+                persist_payload_history(
+                    &store,
+                    &PropagatedBlock {
+                        height,
+                        parent_id: Hash::digest(height.to_be_bytes()),
+                        transactions: Vec::new(),
+                        base_fees: Vec::new(),
+                    },
+                )
+                .unwrap();
+            }
+        }
+
+        // Reopening stands in for the serving peer restarting after it
+        // committed these blocks. The two heights outside the 1,024-height
+        // catch-up window are gone, while both ends of the retained range
+        // decode back to their exact payload.
+        let store = RocksDbStore::open(&path).unwrap();
+        assert!(persisted_payload_at_height(&store, 1).unwrap().is_none());
+        assert!(persisted_payload_at_height(&store, 2).unwrap().is_none());
+        for height in [3, last_height] {
+            let payload = persisted_payload_at_height(&store, height)
+                .unwrap()
+                .expect("a retained payload must survive restart");
+            assert_eq!(payload.height, height);
+            assert_eq!(payload.parent_id, Hash::digest(height.to_be_bytes()));
+        }
+    }
+
+    #[test]
+    fn a_leaders_proposal_identity_survives_restart_until_submission() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("store");
+        let payload = PropagatedBlock {
+            height: 41,
+            parent_id: Hash::digest(b"proposal-parent"),
+            transactions: Vec::new(),
+            base_fees: Vec::new(),
+        };
+
+        {
+            let store = RocksDbStore::open(&path).unwrap();
+            persist_proposal(&store, &payload).unwrap();
+        }
+
+        let store = RocksDbStore::open(&path).unwrap();
+        assert_eq!(
+            persisted_proposal(&store, payload.height, payload.parent_id).unwrap(),
+            Some(payload.clone()),
+            "a restarted leader must rebuild the exact block it may already have voted for"
+        );
+        store
+            .delete(&proposal_key(payload.height, payload.parent_id))
+            .unwrap();
+        assert!(
+            persisted_proposal(&store, payload.height, payload.parent_id)
+                .unwrap()
+                .is_none(),
+            "a submitted height no longer needs its pre-consensus proposal record"
+        );
     }
 
     #[test]

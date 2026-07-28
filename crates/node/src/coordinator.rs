@@ -27,43 +27,45 @@ use types::Hash;
 
 use crate::{GenesisDocument, GenesisError};
 
-/// Reclassifies an honest replica's *safe refusal to sign a vote* as "skip this
-/// vote", not a fatal fault. Two refusals are safe and can both happen in normal
-/// operation; every other consensus failure stays fatal.
+/// Turns any replica *refusal to sign a vote* into "skip this vote", never a
+/// fatal fault. Applied only to the vote-casting calls (`vote_for_proposal`,
+/// `vote_to_commit`), whose every error means "do not vote for this" —
+/// `ProposalRoundMismatch`, `WrongLeader`, `InvalidProposal`,
+/// `LockedOnDifferentBlock`, `ConflictingFirstRoundVote`, `LocalDoubleVote`, or
+/// a bad justify certificate.
 ///
-/// - `ConflictingFirstRoundVote`: the replica already cast this view's timeout
-///   vote and must not also cast an order vote for it (the TD-022 mutual
-///   exclusion). Under a slow round this is an ordinary race — the round timed
-///   out, then a delayed proposal arrived.
+/// The invariant that makes this safe: **declining to cast a vote can never
+/// cause a safety violation** — safety is only ever endangered by *casting*
+/// conflicting votes, which these refusals exist to prevent. So the correct
+/// response to a refusal is simply not to vote; the round then advances by
+/// timeout or the validator advances by catching up. Propagating a refusal as
+/// fatal instead crashed the whole coordinator, taking a slow, restarted, or
+/// partitioned validator off the network — and under fault churn a second such
+/// death cost the network its quorum. This was found three separate times
+/// (`ConflictingFirstRoundVote`, then `LocalDoubleVote` in INC-003, then
+/// `LockedOnDifferentBlock`), each the same class as INC-001/INC-002; keying on
+/// the invariant rather than on individual variants ends that whack-a-mole.
 ///
-/// - `LocalDoubleVote`: the replica already cast an order vote for a *different*
-///   block at this exact height/view. This legitimately happens after a
-///   **restart**: a leader proposed and self-voted a block at (H, V), restarted
-///   with that vote persisted but the in-memory proposal lost, and — its mempool
-///   having changed meanwhile — rebuilt a *different* block at the same (H, V).
-///   The refusal is the equivocation guard working correctly. Crucially it fires
-///   on the leader's *self-vote*, before the new proposal is broadcast, so
-///   skipping it also prevents the leader from equivocating on the wire; the
-///   node then advances that height by catching up instead.
-///
-/// Propagating either refusal killed the whole coordinator task, taking a merely
-/// slow or freshly restarted validator off the network — a total liveness loss
-/// (INC-003) of the same class as INC-001/INC-002. Refusing to cast the vote is
-/// the safe action, so it is skipped and logged rather than fatal.
-fn skip_safe_vote_refusal(
-    result: Result<Vote, ConsensusError>,
-) -> Result<Option<Vote>, ConsensusError> {
+/// Certificate *application* (`advance_view`, `finalize`) is deliberately not
+/// routed through here: an error there (e.g. `SafetyViolation`) is a genuine
+/// invariant break and must stay fatal.
+fn skip_safe_vote_refusal(result: Result<Vote, ConsensusError>) -> Option<Vote> {
     match result {
-        Ok(vote) => Ok(Some(vote)),
-        Err(ConsensusError::ConflictingFirstRoundVote) => Ok(None),
-        Err(ConsensusError::LocalDoubleVote) => {
-            warn!(
-                "declined to sign a second, different vote for one height/view; skipping it \
-                 (expected after a restart re-proposal) rather than failing"
-            );
-            Ok(None)
+        Ok(vote) => Some(vote),
+        // The equivocation/lock safety guards firing — rarer, worth surfacing.
+        Err(
+            error @ (ConsensusError::LocalDoubleVote
+            | ConsensusError::ConflictingFirstRoundVote
+            | ConsensusError::LockedOnDifferentBlock),
+        ) => {
+            warn!(%error, "declined to sign an unsafe vote; skipping it rather than failing");
+            None
         }
-        Err(error) => Err(error),
+        // Stale, misrouted, or wrong-round proposals arrive routinely.
+        Err(error) => {
+            debug!(%error, "skipping a vote for an unvotable proposal");
+            None
+        }
     }
 }
 
@@ -425,68 +427,75 @@ impl ConsensusCoordinator {
         let height = self.replica.height();
         let view = self.replica.view();
         let leader = self.validators.leader(height, view).id;
-        if self.id == leader && !round.proposal_delay_elapsed(self.faults.proposal_delay) {
-            return Ok(None);
-        }
+        // Proposal delay/readiness may suppress proposal creation, but must
+        // never suppress the pacemaker below. Returning early here (or when the
+        // proposal source was temporarily not ready) froze the current view
+        // forever because the round-timeout code was never reached.
+        let proposal_delay_elapsed = round.proposal_delay_elapsed(self.faults.proposal_delay);
         if self.id == leader
+            && proposal_delay_elapsed
             && self.faults.equivocate_when_leader
             && !round.has(RoundFlag::EquivocationSent)
         {
             self.broadcast_equivocation(height, view).await?;
             round.set(RoundFlag::EquivocationSent);
         } else if self.id == leader
+            && proposal_delay_elapsed
             && !self.faults.equivocate_when_leader
             && (round.proposal.is_none()
                 || round.last_proposal_broadcast.elapsed() >= self.config.proposal_rebroadcast)
         {
             if round.proposal.is_none() {
-                if round.should_defer_empty_proposal(
+                let defer_empty = round.should_defer_empty_proposal(
                     EMPTY_MEMPOOL_PROPAGATION_MARGIN,
                     self.proposal_source.is_empty(),
-                ) {
-                    return Ok(None);
-                }
-                let Some((transaction_ids, fee_commitment)) = self
-                    .proposal_source
-                    .transaction_ids(height, self.replica.parent_id())
-                else {
-                    // The leader has nothing to propose, so this height cannot
-                    // start until it does. If every leader in turn reports this,
-                    // the chain stops at a height with no other symptom.
-                    debug!(height, view, "leader has no proposal available");
-                    return Ok(None);
-                };
-                debug!(
-                    height,
-                    view,
-                    transaction_count = transaction_ids.len(),
-                    "proposing as leader"
                 );
-                let proposal = Proposal::new(
-                    height,
-                    view,
-                    self.replica.parent_id(),
-                    self.id,
-                    transaction_ids,
-                    fee_commitment,
-                    None,
-                );
-                let signed = SignedProposal::sign(
-                    proposal.clone(),
-                    &self.private_key,
-                    self.scheme.as_ref(),
-                )?;
-                if let Some(vote) =
-                    skip_safe_vote_refusal(self.replica.vote_for_proposal(&proposal))?
-                {
-                    self.persist()?;
-                    round.order_votes.insert(vote.validator, vote);
-                    round.proposal = Some(signed);
-                } else {
+                if defer_empty {
                     debug!(
                         height,
-                        view, "already timed out this view; not proposing into it"
+                        view, "waiting briefly for transaction gossip before an empty proposal"
                     );
+                } else if let Some((transaction_ids, fee_commitment)) = self
+                    .proposal_source
+                    .transaction_ids(height, self.replica.parent_id())
+                {
+                    debug!(
+                        height,
+                        view,
+                        transaction_count = transaction_ids.len(),
+                        "proposing as leader"
+                    );
+                    let proposal = Proposal::new(
+                        height,
+                        view,
+                        self.replica.parent_id(),
+                        self.id,
+                        transaction_ids,
+                        fee_commitment,
+                        None,
+                    );
+                    let signed = SignedProposal::sign(
+                        proposal.clone(),
+                        &self.private_key,
+                        self.scheme.as_ref(),
+                    )?;
+                    if let Some(vote) =
+                        skip_safe_vote_refusal(self.replica.vote_for_proposal(&proposal))
+                    {
+                        self.persist()?;
+                        round.order_votes.insert(vote.validator, vote);
+                        round.proposal = Some(signed);
+                    } else {
+                        debug!(
+                            height,
+                            view, "already timed out this view; not proposing into it"
+                        );
+                    }
+                } else {
+                    // A recovering pipeline can temporarily refuse to build
+                    // height H+1 until H is retired locally. Keep ticking so
+                    // the round can time out and another leader can take over.
+                    debug!(height, view, "leader has no proposal available");
                 }
             }
             if let Some(proposal) = &round.proposal {
@@ -498,7 +507,6 @@ impl ConsensusCoordinator {
 
         if self.id != leader
             && !self.faults.withhold_votes
-            && !round.has(RoundFlag::ProposalVoteSent)
             && !round.has(RoundFlag::EquivocationDetected)
             && round
                 .first_proposal_at
@@ -506,23 +514,38 @@ impl ConsensusCoordinator {
             && let Some(signed) = round.observed_proposals.values().next()
         {
             let proposer = signed.proposal.proposer;
-            let voted = skip_safe_vote_refusal(self.replica.vote_for_proposal(&signed.proposal))?;
-            // Marked either way: a view this replica has already timed out will
-            // never produce an order vote, so retrying on every tick would only
-            // spin and re-log until the timeout certificate advances the view.
-            round.set(RoundFlag::ProposalVoteSent);
-            if let Some(mut vote) = voted {
-                self.persist()?;
-                if self.faults.corrupt_votes && !vote.signature.is_empty() {
-                    vote.signature[0] ^= 1;
+            if !round.has(RoundFlag::ProposalVoteSent) {
+                let voted =
+                    skip_safe_vote_refusal(self.replica.vote_for_proposal(&signed.proposal));
+                // Marked either way: a view this replica has already timed out
+                // will never produce an order vote, so retrying the signing
+                // operation on every tick would only spin and re-log.
+                round.set(RoundFlag::ProposalVoteSent);
+                if let Some(mut vote) = voted {
+                    self.persist()?;
+                    if self.faults.corrupt_votes && !vote.signature.is_empty() {
+                        vote.signature[0] ^= 1;
+                    }
+                    round.proposal_vote = Some(vote);
+                } else {
+                    debug!(
+                        height,
+                        view, "already timed out this view; skipping its order vote"
+                    );
                 }
+            }
+            if round.proposal_vote.is_some()
+                && round
+                    .last_proposal_vote_sent
+                    .is_none_or(|sent| sent.elapsed() >= self.config.proposal_rebroadcast)
+            {
                 debug!(height, view, %proposer, "voting on observed proposal");
-                self.send(proposer, WireMessage::Vote(vote)).await;
-            } else {
-                debug!(
-                    height,
-                    view, "already timed out this view; skipping its order vote"
-                );
+                self.send(
+                    proposer,
+                    WireMessage::Vote(round.proposal_vote.clone().unwrap()),
+                )
+                .await;
+                round.last_proposal_vote_sent = Some(Instant::now());
             }
         }
 
@@ -608,26 +631,23 @@ impl ConsensusCoordinator {
             debug!(height, view, "round timed out");
             if let Some(vote) = self.replica.local_timeout()? {
                 self.persist()?;
-                let next_leader = self.validators.leader(height, view.saturating_add(1)).id;
-                if self.id == next_leader {
-                    round.timeout_votes.insert(vote.validator, vote);
-                } else {
-                    self.send(next_leader, WireMessage::Vote(vote)).await;
-                }
+                // Broadcast timeout votes so view recovery does not depend on
+                // the designated next leader already being caught up to this
+                // height. The vote is individually signed and the resulting
+                // certificate still needs the full timeout quorum.
+                round.timeout_votes.insert(vote.validator, vote.clone());
+                self.broadcast(WireMessage::Vote(vote)).await;
             }
         }
-        let next_leader = self.validators.leader(height, view.saturating_add(1)).id;
-        if self.id == next_leader
-            && let Some(certificate) = make_certificate(
-                &self.validators,
-                Arc::clone(&self.scheme),
-                CertificateKind::Timeout,
-                height,
-                view,
-                Hash::default(),
-                &round.timeout_votes,
-            )
-        {
+        if let Some(certificate) = make_certificate(
+            &self.validators,
+            Arc::clone(&self.scheme),
+            CertificateKind::Timeout,
+            height,
+            view,
+            Hash::default(),
+            &round.timeout_votes,
+        ) {
             self.broadcast(WireMessage::Certificate {
                 certificate: certificate.clone(),
                 transaction_ids: None,
@@ -691,16 +711,7 @@ impl ConsensusCoordinator {
                     VotePhase::Commit if self.id == self.replica.leader() => {
                         round.commit_votes.insert(vote.validator, vote);
                     }
-                    VotePhase::Timeout
-                        if self.id
-                            == self
-                                .validators
-                                .leader(
-                                    self.replica.height(),
-                                    self.replica.view().saturating_add(1),
-                                )
-                                .id =>
-                    {
+                    VotePhase::Timeout => {
                         round.timeout_votes.insert(vote.validator, vote);
                     }
                     _ => {}
@@ -711,16 +722,18 @@ impl ConsensusCoordinator {
                 transaction_ids,
                 fee_commitment,
             } => {
-                let expected_sender = if certificate.kind == CertificateKind::Timeout {
-                    self.validators
-                        .leader(certificate.height, certificate.view.saturating_add(1))
-                        .id
-                } else {
-                    self.validators
-                        .leader(certificate.height, certificate.view)
-                        .id
-                };
-                if envelope.sender != expected_sender {
+                let expected_sender = self
+                    .validators
+                    .leader(certificate.height, certificate.view)
+                    .id;
+                if certificate.kind == CertificateKind::Timeout {
+                    // A timeout certificate is quorum-authenticated in its own
+                    // right. Any admitted validator may aggregate/relay it so a
+                    // lagging designated next leader cannot strand the view.
+                    if self.validators.validator(envelope.sender).is_none() {
+                        return Ok(None);
+                    }
+                } else if envelope.sender != expected_sender {
                     return Ok(None);
                 }
                 verify_certificate(&certificate, &self.validators, self.scheme.as_ref())?;
@@ -890,7 +903,13 @@ impl ConsensusCoordinator {
         if self.faults.withhold_votes {
             return Ok(());
         }
-        let mut vote = self.replica.vote_to_commit(certificate)?;
+        // Same invariant as the order-vote path: a refusal to cast the fallback
+        // commit vote (a stale prepare, or a lock on a different block) is safe
+        // to skip, never fatal.
+        let Some(mut vote) = skip_safe_vote_refusal(self.replica.vote_to_commit(certificate))
+        else {
+            return Ok(());
+        };
         self.persist()?;
         if self.faults.corrupt_votes && !vote.signature.is_empty() {
             vote.signature[0] ^= 1;
@@ -944,6 +963,7 @@ impl ConsensusCoordinator {
             height = finalized_height,
             view,
             block = %finalized_block,
+            latency_ms,
             "finalized height"
         );
         self.persist()?;
@@ -1131,6 +1151,11 @@ struct RoundState {
     observed_proposals: BTreeMap<Hash, SignedProposal>,
     relayed_proposals: BTreeSet<Hash>,
     first_proposal_at: Option<Instant>,
+    /// The already-signed order vote is retransmitted until a certificate
+    /// arrives. Once an order vote is cast this protocol forbids a timeout vote
+    /// in the same view, so a lost one-shot send would otherwise strand it.
+    proposal_vote: Option<Vote>,
+    last_proposal_vote_sent: Option<Instant>,
     order_votes: BTreeMap<Hash, Vote>,
     commit_votes: BTreeMap<Hash, Vote>,
     timeout_votes: BTreeMap<Hash, Vote>,
@@ -1166,6 +1191,8 @@ impl RoundState {
             observed_proposals: BTreeMap::new(),
             relayed_proposals: BTreeSet::new(),
             first_proposal_at: None,
+            proposal_vote: None,
+            last_proposal_vote_sent: None,
             order_votes: BTreeMap::new(),
             commit_votes: BTreeMap::new(),
             timeout_votes: BTreeMap::new(),
@@ -1344,33 +1371,27 @@ mod tests {
     }
 
     #[test]
-    fn a_safe_vote_refusal_is_skipped_but_other_failures_stay_fatal() {
-        // A replica refusing to cast both first-round votes in one view is the
-        // TD-022 safety rule working, and under a slow round it happens
-        // routinely: the round times out, then a delayed proposal arrives.
-        assert!(
-            super::skip_safe_vote_refusal(Err(super::ConsensusError::ConflictingFirstRoundVote))
-                .expect("a timed-out view must skip its order vote, not fail")
-                .is_none()
-        );
-
-        // A replica declining to sign a second, different vote for one
-        // height/view is the equivocation guard working. It legitimately fires
-        // after a restart, when a leader rebuilds a different block at a
-        // height/view it already voted on (INC-003). It must be skipped, never
-        // fatal — propagating it crashed the coordinator and, under fault churn,
-        // cost the network its quorum.
-        assert!(
-            super::skip_safe_vote_refusal(Err(super::ConsensusError::LocalDoubleVote))
-                .expect("a double-vote refusal must be skipped, not fail")
-                .is_none()
-        );
-
-        // Genuine consensus faults must still be fatal.
-        assert!(
-            super::skip_safe_vote_refusal(Err(super::ConsensusError::CertificateRoundMismatch))
-                .is_err()
-        );
+    fn every_vote_refusal_is_skipped_never_fatal() {
+        // Declining to cast a vote can never cause a safety violation, so no
+        // vote refusal is fatal — each was found (one at a time) crashing the
+        // coordinator and, under fault churn, costing the network its quorum:
+        // ConflictingFirstRoundVote (a timed-out view), LocalDoubleVote (a
+        // restart re-proposal, INC-003), and LockedOnDifferentBlock (a lock
+        // conflict). The routine round-mismatch/wrong-leader/invalid-proposal
+        // refusals are equally safe to skip. All must return `None`, never fail.
+        for error in [
+            super::ConsensusError::ConflictingFirstRoundVote,
+            super::ConsensusError::LocalDoubleVote,
+            super::ConsensusError::LockedOnDifferentBlock,
+            super::ConsensusError::ProposalRoundMismatch,
+            super::ConsensusError::WrongLeader,
+            super::ConsensusError::InvalidProposal,
+        ] {
+            assert!(
+                super::skip_safe_vote_refusal(Err(error)).is_none(),
+                "a vote refusal must be skipped, not crash the coordinator"
+            );
+        }
     }
 
     #[test]
@@ -1624,6 +1645,85 @@ mod tests {
                 .iter()
                 .all(|outcome| outcome.view_changes == outcomes[0].view_changes)
         );
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.finalized_block == outcomes[0].finalized_block)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn timeout_quorum_advances_without_the_next_view_leader() {
+        let _serialised = REAL_TCP_TESTS.lock().await;
+        let directory = TempDir::new().unwrap();
+        let (genesis, keys) = fixture_genesis(5);
+        let validated = genesis.validate().unwrap();
+        let initial_leader = validated.validators.leader(1, 0).id;
+        let missing_next_leader = validated.validators.leader(1, 1).id;
+        assert_ne!(initial_leader, missing_next_leader);
+
+        let mut tasks = Vec::new();
+        for (index, entry) in genesis.validators.iter().enumerate() {
+            if entry.validator.id == missing_next_leader {
+                continue;
+            }
+            let status = Arc::new(RwLock::new(NodeStatus {
+                chain_id: genesis.chain_id.clone(),
+                genesis_hash: validated.genesis_hash,
+                finalized_height: 0,
+                committed_height: 0,
+                finalized_block: validated.genesis_hash,
+                state_root: validated.state_root,
+                peer_count: 0,
+                ready: false,
+                finality_latency_ms: None,
+                view_changes: 0,
+            }));
+            let coordinator = ConsensusCoordinator::bind(
+                &genesis,
+                entry.validator.id,
+                keys[index].clone(),
+                directory
+                    .path()
+                    .join(format!("missing-next-leader-{index}")),
+                status,
+                CoordinatorConfig {
+                    stop_after_height: Some(1),
+                    ..CoordinatorConfig::default()
+                },
+                CoordinatorFaults {
+                    // Force view 0 to time out. View 1's scheduled leader is
+                    // absent, so the live 80% must aggregate both timeout
+                    // certificates without depending on that validator.
+                    proposal_delay: if entry.validator.id == initial_leader {
+                        Duration::from_millis(500)
+                    } else {
+                        Duration::ZERO
+                    },
+                    ..CoordinatorFaults::default()
+                },
+            )
+            .await
+            .unwrap();
+            let genesis_time = genesis.genesis_unix_ms;
+            tasks.push(tokio::spawn(async move {
+                coordinator.run(genesis_time).await.unwrap()
+            }));
+        }
+
+        let outcomes = tokio::time::timeout(REAL_TCP_CONSENSUS_BOUND, async {
+            let mut outcomes = Vec::new();
+            for task in tasks {
+                outcomes.push(task.await.unwrap());
+            }
+            outcomes
+        })
+        .await
+        .expect("the live timeout quorum was stranded behind the absent view-1 leader");
+
+        assert_eq!(outcomes.len(), 4);
+        assert!(outcomes.iter().all(|outcome| outcome.finalized_height == 1));
+        assert!(outcomes.iter().all(|outcome| outcome.view_changes >= 2));
         assert!(
             outcomes
                 .iter()
