@@ -43,7 +43,7 @@ enum VoterFault {
 #[allow(clippy::too_many_lines)] // Keep each multi-process fault timeline auditable end to end.
 fn run_scenario(leader_fault: LeaderFault, voter_fault: VoterFault) {
     let directory = TempDir::new().unwrap();
-    let (mut genesis, keys, gossip_identities) = fixture_genesis();
+    let (mut genesis, keys, gossip_identities, address_reservations) = fixture_genesis();
     let initial = genesis.validate().unwrap();
     let leader = initial.validators.leader(1, 0).id;
     let byzantine = genesis
@@ -98,6 +98,11 @@ fn run_scenario(leader_fault: LeaderFault, voter_fault: VoterFault) {
         .map(|entry| entry.validator.id.to_string())
         .collect::<Vec<_>>()
         .join(",");
+    // Keep every generated endpoint distinct while building and validating
+    // genesis. Linux may immediately return the same ephemeral port after a
+    // bind-and-drop reservation, especially across the four scenarios in this
+    // test. Release them only when the child nodes are ready to bind.
+    drop(address_reservations);
     let mut children = Vec::new();
     for (index, entry) in genesis.validators.iter().enumerate() {
         let key_path = directory.path().join(format!("validator-{index}.key"));
@@ -266,10 +271,12 @@ fn fixture_genesis() -> (
     GenesisDocument,
     Vec<Vec<u8>>,
     Vec<libp2p::identity::Keypair>,
+    Vec<TcpListener>,
 ) {
     let scheme = Bls12381Scheme;
     let mut keys = Vec::new();
     let mut gossip_identities = Vec::new();
+    let mut address_reservations = Vec::new();
     let validators = (1_u8..=5)
         .map(|index| {
             let key = vec![index; 32];
@@ -287,10 +294,13 @@ fn fixture_genesis() -> (
                     public_key,
                     proof_of_possession: scheme.proof_of_possession(&key).unwrap(),
                 },
-                network_address: reserve_address().to_string(),
-                rpc_address: reserve_address().to_string(),
+                network_address: reserve_address(&mut address_reservations).to_string(),
+                rpc_address: reserve_address(&mut address_reservations).to_string(),
                 gossip_peer_id,
-                gossip_address: format!("/ip4/127.0.0.1/tcp/{}", reserve_address().port()),
+                gossip_address: format!(
+                    "/ip4/127.0.0.1/tcp/{}",
+                    reserve_address(&mut address_reservations).port()
+                ),
             }
         })
         .collect();
@@ -313,10 +323,13 @@ fn fixture_genesis() -> (
         },
         keys,
         gossip_identities,
+        address_reservations,
     )
 }
 
-fn reserve_address() -> SocketAddr {
+fn reserve_address(reservations: &mut Vec<TcpListener>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
+    let address = listener.local_addr().unwrap();
+    reservations.push(listener);
+    address
 }
