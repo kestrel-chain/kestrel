@@ -18,8 +18,8 @@ mod lifecycle;
 mod pipeline;
 
 pub use coordinator::{
-    ConsensusCoordinator, CoordinatorConfig, CoordinatorError, CoordinatorFaults,
-    CoordinatorOutcome, ProposalTransactionSource,
+    CertificateEmission, ConsensusCoordinator, CoordinatorConfig, CoordinatorError,
+    CoordinatorFaults, CoordinatorOutcome, ProposalTransactionSource,
 };
 pub use lifecycle::{
     BlockLifecycle, DurableBlockRecord, LifecycleError, PropagatedBlock, SignedExecutionPayload,

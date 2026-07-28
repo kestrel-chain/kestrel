@@ -9,8 +9,8 @@ use anyhow::{Context, Result, bail};
 use libp2p::{Multiaddr, PeerId, identity};
 use network::{ConfiguredPeer, GossipConfig, NetworkFaults, NetworkNode};
 use node::{
-    BlockLifecycle, ConsensusCoordinator, CoordinatorConfig, CoordinatorFaults, GenesisDocument,
-    Stage2Pipeline, Stage2PipelineConfig,
+    BlockLifecycle, CertificateEmission, ConsensusCoordinator, CoordinatorConfig,
+    CoordinatorFaults, GenesisDocument, Stage2Pipeline, Stage2PipelineConfig,
 };
 use rpc::{NodeStatus, RpcConfig, RpcService, TransactionSubmitter};
 use state::StateTree;
@@ -161,6 +161,14 @@ async fn main() -> Result<()> {
 
         let faults = CoordinatorFaults {
             withhold_votes: arguments.iter().any(|value| value == "--withhold-votes"),
+            certificate_emission: if arguments
+                .iter()
+                .any(|value| value == "--withhold-certificates")
+            {
+                CertificateEmission::Withhold
+            } else {
+                CertificateEmission::Enabled
+            },
             corrupt_votes: arguments.iter().any(|value| value == "--corrupt-votes"),
             equivocate_when_leader: arguments.iter().any(|value| value == "--equivocate"),
             blocked_peers: value_after(&arguments, "--blocked-peers")

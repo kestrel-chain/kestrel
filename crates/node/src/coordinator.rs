@@ -9,7 +9,7 @@ use std::{
 use consensus::{
     CertificateKind, ConsensusError, FinalizedOrder, Proposal, QuorumCertificate, Replica,
     ReplicaSnapshot, SignedProposal, ValidatorSet, Vote, VoteCollector, VotePhase,
-    verify_certificate,
+    verify_certificate, verify_vote,
 };
 use crypto::{AggregateSignatureScheme, Bls12381Scheme};
 use rpc::NodeStatus;
@@ -120,12 +120,22 @@ impl Default for CoordinatorConfig {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CoordinatorFaults {
     pub withhold_votes: bool,
+    pub certificate_emission: CertificateEmission,
     pub corrupt_votes: bool,
     pub equivocate_when_leader: bool,
     pub blocked_peers: BTreeSet<Hash>,
     pub outbound_delay: Duration,
     pub drop_basis_points: u16,
     pub proposal_delay: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CertificateEmission {
+    #[default]
+    Enabled,
+    /// Forms and disseminates votes but never originates a certificate. This
+    /// models a leader that collects votes and withholds the aggregate.
+    Withhold,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -479,12 +489,15 @@ impl ConsensusCoordinator {
                         &self.private_key,
                         self.scheme.as_ref(),
                     )?;
-                    if let Some(vote) =
+                    round.proposal = Some(signed);
+                    if self.faults.withhold_votes {
+                        debug!(height, view, "withholding local leader order vote");
+                    } else if let Some(vote) =
                         skip_safe_vote_refusal(self.replica.vote_for_proposal(&proposal))
                     {
                         self.persist()?;
-                        round.order_votes.insert(vote.validator, vote);
-                        round.proposal = Some(signed);
+                        round.order_votes.insert(vote.validator, vote.clone());
+                        round.proposal_vote = Some(vote);
                     } else {
                         debug!(
                             height,
@@ -512,45 +525,44 @@ impl ConsensusCoordinator {
                 .first_proposal_at
                 .is_some_and(|received| received.elapsed() >= self.config.proposal_vote_delay)
             && let Some(signed) = round.observed_proposals.values().next()
+            && !round.has(RoundFlag::ProposalVoteSent)
         {
-            let proposer = signed.proposal.proposer;
-            if !round.has(RoundFlag::ProposalVoteSent) {
-                let voted =
-                    skip_safe_vote_refusal(self.replica.vote_for_proposal(&signed.proposal));
-                // Marked either way: a view this replica has already timed out
-                // will never produce an order vote, so retrying the signing
-                // operation on every tick would only spin and re-log.
-                round.set(RoundFlag::ProposalVoteSent);
-                if let Some(mut vote) = voted {
-                    self.persist()?;
-                    if self.faults.corrupt_votes && !vote.signature.is_empty() {
-                        vote.signature[0] ^= 1;
-                    }
-                    round.proposal_vote = Some(vote);
-                } else {
-                    debug!(
-                        height,
-                        view, "already timed out this view; skipping its order vote"
-                    );
+            let voted = skip_safe_vote_refusal(self.replica.vote_for_proposal(&signed.proposal));
+            // Marked either way: a view this replica has already timed out
+            // will never produce an order vote, so retrying the signing
+            // operation on every tick would only spin and re-log.
+            round.set(RoundFlag::ProposalVoteSent);
+            if let Some(mut vote) = voted {
+                self.persist()?;
+                if self.faults.corrupt_votes && !vote.signature.is_empty() {
+                    vote.signature[0] ^= 1;
                 }
-            }
-            if round.proposal_vote.is_some()
-                && round
-                    .last_proposal_vote_sent
-                    .is_none_or(|sent| sent.elapsed() >= self.config.proposal_rebroadcast)
-            {
-                debug!(height, view, %proposer, "voting on observed proposal");
-                self.send(
-                    proposer,
-                    WireMessage::Vote(round.proposal_vote.clone().unwrap()),
-                )
-                .await;
-                round.last_proposal_vote_sent = Some(Instant::now());
+                round.order_votes.insert(vote.validator, vote.clone());
+                round.proposal_vote = Some(vote);
+            } else {
+                debug!(
+                    height,
+                    view, "already timed out this view; skipping its order vote"
+                );
             }
         }
+        if let Some(vote) = round.proposal_vote.clone()
+            && round
+                .last_proposal_vote_sent
+                .is_none_or(|sent| sent.elapsed() >= self.config.proposal_rebroadcast)
+        {
+            debug!(
+                height,
+                view,
+                block = %vote.block_id,
+                "broadcasting order vote"
+            );
+            self.broadcast(WireMessage::Vote(vote)).await;
+            round.last_proposal_vote_sent = Some(Instant::now());
+        }
 
-        if self.id == leader
-            && let Some(proposal) = &round.proposal
+        if self.faults.certificate_emission == CertificateEmission::Enabled
+            && let Some(proposal) = round.proposal_for_certification()
         {
             let block_id = proposal.proposal.block_id;
             let proposal_transaction_ids = proposal.proposal.transaction_ids.clone();
@@ -622,6 +634,21 @@ impl ConsensusCoordinator {
                     round,
                 );
             }
+        }
+
+        if let Some(vote) = round.commit_vote.clone()
+            && round
+                .last_commit_vote_sent
+                .is_none_or(|sent| sent.elapsed() >= self.config.proposal_rebroadcast)
+        {
+            debug!(
+                height,
+                view,
+                block = %vote.block_id,
+                "broadcasting commit vote"
+            );
+            self.broadcast(WireMessage::Vote(vote)).await;
+            round.last_commit_vote_sent = Some(Instant::now());
         }
 
         if round.started.elapsed() >= round_timeout_for_view(self.config.round_timeout, view)
@@ -704,17 +731,22 @@ impl ConsensusCoordinator {
                 {
                     return Ok(None);
                 }
+                if let Err(error) = verify_vote(&vote, &self.validators, self.scheme.as_ref()) {
+                    debug!(%error, validator = %vote.validator, "discarding invalid vote");
+                    return Ok(None);
+                }
                 match vote.phase {
-                    VotePhase::Order if self.id == self.replica.leader() => {
-                        round.order_votes.insert(vote.validator, vote);
+                    VotePhase::Order => {
+                        round.order_votes.entry(vote.validator).or_insert(vote);
                     }
-                    VotePhase::Commit if self.id == self.replica.leader() => {
-                        round.commit_votes.insert(vote.validator, vote);
+                    VotePhase::Commit => {
+                        round.commit_votes.entry(vote.validator).or_insert(vote);
                     }
                     VotePhase::Timeout => {
-                        round.timeout_votes.insert(vote.validator, vote);
+                        if vote.block_id == Hash::default() {
+                            round.timeout_votes.entry(vote.validator).or_insert(vote);
+                        }
                     }
-                    _ => {}
                 }
             }
             WireMessage::Certificate {
@@ -722,20 +754,16 @@ impl ConsensusCoordinator {
                 transaction_ids,
                 fee_commitment,
             } => {
+                // Every certificate is quorum-authenticated in its own right.
+                // Any admitted validator may aggregate and relay it, removing
+                // the designated leader as a single point of liveness failure.
+                if self.validators.validator(envelope.sender).is_none() {
+                    return Ok(None);
+                }
                 let expected_sender = self
                     .validators
                     .leader(certificate.height, certificate.view)
                     .id;
-                if certificate.kind == CertificateKind::Timeout {
-                    // A timeout certificate is quorum-authenticated in its own
-                    // right. Any admitted validator may aggregate/relay it so a
-                    // lagging designated next leader cannot strand the view.
-                    if self.validators.validator(envelope.sender).is_none() {
-                        return Ok(None);
-                    }
-                } else if envelope.sender != expected_sender {
-                    return Ok(None);
-                }
                 verify_certificate(&certificate, &self.validators, self.scheme.as_ref())?;
                 if certificate.height != self.replica.height() {
                     if certificate.height > self.replica.height() {
@@ -903,6 +931,9 @@ impl ConsensusCoordinator {
         if self.faults.withhold_votes {
             return Ok(());
         }
+        if round.commit_vote.is_some() {
+            return Ok(());
+        }
         // Same invariant as the order-vote path: a refusal to cast the fallback
         // commit vote (a stale prepare, or a lock on a different block) is safe
         // to skip, never fatal.
@@ -914,12 +945,10 @@ impl ConsensusCoordinator {
         if self.faults.corrupt_votes && !vote.signature.is_empty() {
             vote.signature[0] ^= 1;
         }
-        let leader = self.replica.leader();
-        if leader == self.id {
-            round.commit_votes.insert(vote.validator, vote);
-        } else {
-            self.send(leader, WireMessage::Vote(vote)).await;
-        }
+        round.commit_votes.insert(vote.validator, vote.clone());
+        round.commit_vote = Some(vote.clone());
+        self.broadcast(WireMessage::Vote(vote)).await;
+        round.last_commit_vote_sent = Some(Instant::now());
         Ok(())
     }
 
@@ -1156,6 +1185,10 @@ struct RoundState {
     /// in the same view, so a lost one-shot send would otherwise strand it.
     proposal_vote: Option<Vote>,
     last_proposal_vote_sent: Option<Instant>,
+    /// The already-signed fallback commit vote is likewise retransmitted until
+    /// a commit certificate arrives.
+    commit_vote: Option<Vote>,
+    last_commit_vote_sent: Option<Instant>,
     order_votes: BTreeMap<Hash, Vote>,
     commit_votes: BTreeMap<Hash, Vote>,
     timeout_votes: BTreeMap<Hash, Vote>,
@@ -1193,6 +1226,8 @@ impl RoundState {
             first_proposal_at: None,
             proposal_vote: None,
             last_proposal_vote_sent: None,
+            commit_vote: None,
+            last_commit_vote_sent: None,
             order_votes: BTreeMap::new(),
             commit_votes: BTreeMap::new(),
             timeout_votes: BTreeMap::new(),
@@ -1213,6 +1248,12 @@ impl RoundState {
 
     fn should_defer_empty_proposal(&self, margin: Duration, source_is_empty: bool) -> bool {
         self.follows_commit && source_is_empty && self.height_started.elapsed() < margin
+    }
+
+    fn proposal_for_certification(&self) -> Option<SignedProposal> {
+        self.proposal
+            .clone()
+            .or_else(|| self.observed_proposals.values().next().cloned())
     }
 
     fn has(&self, flag: RoundFlag) -> bool {
@@ -1528,6 +1569,124 @@ mod tests {
                 .iter()
                 .all(|outcome| outcome.finalized_height == 3)
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn validators_form_a_fast_certificate_when_the_leader_withholds_it() {
+        let _serialised = REAL_TCP_TESTS.lock().await;
+        let outcomes = run_certificate_withholding_scenario(false).await;
+
+        assert_eq!(outcomes.len(), 5);
+        assert!(outcomes.iter().all(|outcome| outcome.finalized_height == 1));
+        assert!(outcomes.iter().all(|outcome| outcome.view_changes == 0));
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.finalized_block == outcomes[0].finalized_block)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn validators_form_prepare_and_commit_certificates_when_the_leader_withholds_them() {
+        let _serialised = REAL_TCP_TESTS.lock().await;
+        let outcomes = run_certificate_withholding_scenario(true).await;
+
+        assert_eq!(outcomes.len(), 5);
+        assert!(outcomes.iter().all(|outcome| outcome.finalized_height == 1));
+        assert!(outcomes.iter().all(|outcome| outcome.view_changes == 0));
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| outcome.finalized_block == outcomes[0].finalized_block)
+        );
+    }
+
+    async fn run_certificate_withholding_scenario(
+        force_fallback: bool,
+    ) -> Vec<super::CoordinatorOutcome> {
+        let directory = TempDir::new().unwrap();
+        let (mut genesis, keys, address_reservations) = fixture_genesis(5);
+        let initial = genesis.validate().unwrap();
+        let leader = initial.validators.leader(1, 0).id;
+        let silent_voter = genesis
+            .validators
+            .iter()
+            .map(|entry| entry.validator.id)
+            .find(|id| *id != leader)
+            .unwrap();
+
+        if force_fallback {
+            // Three honest replicas contribute exactly 60%. The 10% leader
+            // withholds its own vote and the remaining 30% replica does not
+            // vote. This can form prepare and commit certificates, but can
+            // never reach the 80% fast threshold.
+            for entry in &mut genesis.validators {
+                entry.validator.stake = if entry.validator.id == leader {
+                    10
+                } else if entry.validator.id == silent_voter {
+                    30
+                } else {
+                    20
+                };
+            }
+        }
+        let validated = genesis.validate().unwrap();
+        drop(address_reservations);
+
+        let mut tasks = Vec::new();
+        for (index, entry) in genesis.validators.iter().enumerate() {
+            let status = Arc::new(RwLock::new(NodeStatus {
+                chain_id: genesis.chain_id.clone(),
+                genesis_hash: validated.genesis_hash,
+                finalized_height: 0,
+                committed_height: 0,
+                finalized_block: validated.genesis_hash,
+                state_root: validated.state_root,
+                peer_count: 0,
+                ready: false,
+                finality_latency_ms: None,
+                view_changes: 0,
+            }));
+            let coordinator = ConsensusCoordinator::bind(
+                &genesis,
+                entry.validator.id,
+                keys[index].clone(),
+                directory
+                    .path()
+                    .join(format!("certificate-withholding-{index}")),
+                status,
+                CoordinatorConfig {
+                    stop_after_height: Some(1),
+                    ..CoordinatorConfig::default()
+                },
+                CoordinatorFaults {
+                    withhold_votes: entry.validator.id == leader
+                        || (force_fallback && entry.validator.id == silent_voter),
+                    certificate_emission: if entry.validator.id == leader {
+                        super::CertificateEmission::Withhold
+                    } else {
+                        super::CertificateEmission::Enabled
+                    },
+                    ..CoordinatorFaults::default()
+                },
+            )
+            .await
+            .unwrap();
+            let genesis_time = genesis.genesis_unix_ms;
+            tasks.push(tokio::spawn(async move {
+                coordinator.run(genesis_time).await.unwrap()
+            }));
+        }
+
+        tokio::time::timeout(REAL_TCP_CONSENSUS_BOUND, async {
+            let mut outcomes = Vec::new();
+            for task in tasks {
+                outcomes.push(task.await.unwrap());
+            }
+            outcomes
+        })
+        .await
+        .expect("a withholding leader stranded votes that already reached quorum")
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
