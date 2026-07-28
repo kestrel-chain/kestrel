@@ -121,6 +121,13 @@ impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLog {
 /// global subscriber can only be set once, so every test in this binary shares
 /// it; the long-running test dominates the tail, and spans identify the source.
 static CAPTURED: std::sync::OnceLock<CapturedLog> = std::sync::OnceLock::new();
+/// Each test below creates a complete four-validator network, and the Rust test
+/// harness runs tests in one binary concurrently by default. On a two-core CI
+/// runner that otherwise creates 24 validators across 48 Tokio worker threads,
+/// making genesis-time progress depend on scheduler luck. Keep concurrency
+/// inside each production-composition test, but do not run whole clusters on
+/// top of each other.
+static PIPELINE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn captured_log() -> CapturedLog {
     CAPTURED
@@ -158,6 +165,7 @@ struct Sender {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[allow(clippy::too_many_lines)] // Keep the full multi-node wiring/assertion timeline auditable.
 async fn stage2_pipeline_commits_a_gossiped_transaction_across_all_nodes() {
+    let _test_guard = PIPELINE_TEST_LOCK.lock().await;
     let directory = TempDir::new().unwrap();
     let account_key = [7_u8; 32];
     let account_public_key = Ed25519Scheme.public_key(&account_key).unwrap();
@@ -379,6 +387,7 @@ async fn stage2_pipeline_commits_a_gossiped_transaction_across_all_nodes() {
 /// refusing to build a proposal more than one height ahead of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
+    let _test_guard = PIPELINE_TEST_LOCK.lock().await;
     run_concurrent_independent_senders(30).await;
 }
 
@@ -731,6 +740,7 @@ async fn a_validator_that_missed_a_payload_recovers_it_from_peers() {
     // repair batch. This is intentionally a catch-up backlog, not the old
     // single-payload happy path.
     const TRANSACTION_COUNT: usize = 48;
+    let _test_guard = PIPELINE_TEST_LOCK.lock().await;
     let captured = captured_log();
     let directory = TempDir::new().unwrap();
     let senders = (0..TRANSACTION_COUNT)
@@ -981,6 +991,7 @@ async fn a_validator_that_missed_a_payload_recovers_it_from_peers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[allow(clippy::too_many_lines)]
 async fn execution_falling_behind_ordering_is_reported_not_absorbed_silently() {
+    let _test_guard = PIPELINE_TEST_LOCK.lock().await;
     let directory = TempDir::new().unwrap();
     let bls = Bls12381Scheme;
     let mut bls_keys = Vec::new();
@@ -1187,6 +1198,7 @@ async fn execution_falling_behind_ordering_is_reported_not_absorbed_silently() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[allow(clippy::too_many_lines)]
 async fn malformed_gossiped_transaction_does_not_kill_the_pipeline() {
+    let _test_guard = PIPELINE_TEST_LOCK.lock().await;
     let directory = TempDir::new().unwrap();
     let account_key = [11_u8; 32];
     let account_public_key = Ed25519Scheme.public_key(&account_key).unwrap();
@@ -1427,6 +1439,7 @@ async fn malformed_gossiped_transaction_does_not_kill_the_pipeline() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)] // Keep the full admit/drop/reopen/verify timeline auditable.
 async fn admitted_transaction_survives_a_restart_before_finalization() {
+    let _test_guard = PIPELINE_TEST_LOCK.lock().await;
     let directory = TempDir::new().unwrap();
     let account_key = [21_u8; 32];
     let account_public_key = Ed25519Scheme.public_key(&account_key).unwrap();
