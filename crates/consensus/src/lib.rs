@@ -452,6 +452,27 @@ impl Vote {
     }
 }
 
+/// Verifies the signer and domain-separated signature of one individual vote.
+///
+/// # Errors
+///
+/// Rejects an unknown validator or malformed signature.
+pub fn verify_vote<'a>(
+    vote: &Vote,
+    validators: &'a ValidatorSet,
+    scheme: &dyn AggregateSignatureScheme,
+) -> Result<&'a Validator, ConsensusError> {
+    let validator = validators
+        .validator(vote.validator)
+        .ok_or(ConsensusError::UnknownValidator(vote.validator))?;
+    scheme.verify(
+        &validator.public_key,
+        &vote_message(vote.height, vote.view, vote.block_id, vote.phase),
+        &vote.signature,
+    )?;
+    Ok(validator)
+}
+
 /// Meaning assigned to an aggregate certificate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CertificateKind {
@@ -626,15 +647,7 @@ impl<'a> VoteCollector<'a> {
         {
             return Err(ConsensusError::VoteTargetMismatch);
         }
-        let validator = self
-            .validators
-            .validator(vote.validator)
-            .ok_or(ConsensusError::UnknownValidator(vote.validator))?;
-        self.scheme.verify(
-            &validator.public_key,
-            &vote_message(vote.height, vote.view, vote.block_id, vote.phase),
-            &vote.signature,
-        )?;
+        let validator = verify_vote(&vote, self.validators, self.scheme.as_ref())?;
         if let Some(existing) = self.votes.get(&vote.validator) {
             if existing == &vote.signature {
                 return self.certificate_if_ready();

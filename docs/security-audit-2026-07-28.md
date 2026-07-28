@@ -372,3 +372,26 @@ An independent auditor should receive this report, the corresponding fixes and
 regression tests, protocol specifications, incident history, threat model,
 dependency manifest, and retained Stage 2 evidence. Critical and high findings
 must be re-tested by someone other than the implementer before closure.
+
+## Remediation tracking
+
+### KST-001
+
+**Implementation status:** Remediated on `codex/kst-001-vote-recovery`;
+independent review pending.
+
+Order and commit votes are now individually verified and disseminated to all
+validators. Every validator collects them and may aggregate and relay a
+quorum-authenticated fast, prepare, or commit certificate. Certificate
+acceptance no longer depends on the designated leader being its sender.
+
+Real-TCP regressions cover both audited withholding boundaries:
+
+- exactly 80% order stake forms a fast certificate while the leader withholds
+  its own vote and every certificate;
+- exactly 60% order stake forms prepare and commit certificates while the
+  leader and a 30% validator withhold votes and the leader withholds every
+  certificate.
+
+Both scenarios finalize in the original view. This status does not waive the
+recommended independent proof review or close any other finding.
