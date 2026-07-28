@@ -36,6 +36,11 @@ use tracing::Instrument;
 use types::{Address, Hash, Object, Owner, Transaction};
 
 const VALIDATOR_COUNT: usize = 4;
+/// Opening eight `RocksDB` databases and binding the libp2p/consensus transports
+/// can consume the old 1.5-second lead on a cold two-core CI runner. All
+/// multi-validator fixtures use this window so every listener is accepting
+/// before the first consensus round begins.
+const PIPELINE_TEST_GENESIS_STARTUP_WINDOW_MS: u64 = 10_000;
 /// Events kept from the start of the run and from the end of it. The start
 /// matters because a stall at height 0 is decided during startup; the end
 /// matters because a stall after progress is decided by whatever it was doing
@@ -129,6 +134,17 @@ static CAPTURED: std::sync::OnceLock<CapturedLog> = std::sync::OnceLock::new();
 /// top of each other.
 static PIPELINE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+fn pipeline_test_coordinator_config() -> CoordinatorConfig {
+    CoordinatorConfig {
+        // The production default is appropriate for a warm local network, but
+        // three sequential TCP sends can each consume the 250 ms connect
+        // timeout on a contended debug runner. These tests exercise pipeline
+        // correctness and fault handling, not a finality-latency gate.
+        round_timeout: Duration::from_secs(2),
+        ..CoordinatorConfig::default()
+    }
+}
+
 fn captured_log() -> CapturedLog {
     CAPTURED
         .get_or_init(|| {
@@ -214,7 +230,7 @@ async fn stage2_pipeline_commits_a_gossiped_transaction_across_all_nodes() {
     let genesis = GenesisDocument {
         format_version: GENESIS_FORMAT_VERSION,
         chain_id: "kestrel-stage2-pipeline-test".to_owned(),
-        genesis_unix_ms: u64::try_from(now).unwrap() + 1_500,
+        genesis_unix_ms: u64::try_from(now).unwrap() + PIPELINE_TEST_GENESIS_STARTUP_WINDOW_MS,
         blocks_per_epoch: 100,
         state_config: StateConfig::default(),
         active_signature_schemes: vec![1, 2],
@@ -306,7 +322,7 @@ async fn stage2_pipeline_commits_a_gossiped_transaction_across_all_nodes() {
             bls_keys[index].clone(),
             directory.path().join(format!("consensus-{index}")),
             Arc::clone(&status),
-            CoordinatorConfig::default(),
+            pipeline_test_coordinator_config(),
             CoordinatorFaults::default(),
             proposal_source,
             finalized_order_sender,
@@ -393,15 +409,6 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
 
 #[allow(clippy::too_many_lines)] // Keep the full multi-node wiring/assertion timeline auditable.
 async fn run_concurrent_independent_senders(transaction_count: usize) {
-    // This fixture opens eight RocksDB databases and binds both libp2p and
-    // consensus transports before the coordinator tasks can enter
-    // `wait_for_genesis`. A 1.5-second lead is already gone on a cold two-core
-    // CI runner, letting the first scheduled validator time out before all
-    // peers are listening. This test measures concurrent transaction
-    // correctness, not startup latency, so give every listener a deterministic
-    // pre-genesis window.
-    const GENESIS_STARTUP_WINDOW_MS: u64 = 10_000;
-
     let log = captured_log();
     let directory = TempDir::new().unwrap();
 
@@ -462,7 +469,7 @@ async fn run_concurrent_independent_senders(transaction_count: usize) {
     let genesis = GenesisDocument {
         format_version: GENESIS_FORMAT_VERSION,
         chain_id: "kestrel-stage2-concurrent-test".to_owned(),
-        genesis_unix_ms: u64::try_from(now).unwrap() + GENESIS_STARTUP_WINDOW_MS,
+        genesis_unix_ms: u64::try_from(now).unwrap() + PIPELINE_TEST_GENESIS_STARTUP_WINDOW_MS,
         blocks_per_epoch: 100,
         state_config: StateConfig::default(),
         active_signature_schemes: vec![1, 2],
@@ -556,15 +563,7 @@ async fn run_concurrent_independent_senders(transaction_count: usize) {
             bls_keys[index].clone(),
             directory.path().join(format!("consensus-{index}")),
             Arc::clone(&status),
-            CoordinatorConfig {
-                // The default 300 ms bound is appropriate for a warm local
-                // network, but three sequential TCP sends can each consume the
-                // 250 ms connect timeout on a contended debug runner. Avoid
-                // turning scheduler delay into a protocol fault in this
-                // throughput/correctness test.
-                round_timeout: Duration::from_secs(2),
-                ..CoordinatorConfig::default()
-            },
+            pipeline_test_coordinator_config(),
             CoordinatorFaults::default(),
             proposal_source,
             finalized_order_sender,
@@ -817,7 +816,7 @@ async fn a_validator_that_missed_a_payload_recovers_it_from_peers() {
     let genesis = GenesisDocument {
         format_version: GENESIS_FORMAT_VERSION,
         chain_id: "kestrel-stage2-repair-test".to_owned(),
-        genesis_unix_ms: u64::try_from(now).unwrap() + 1_500,
+        genesis_unix_ms: u64::try_from(now).unwrap() + PIPELINE_TEST_GENESIS_STARTUP_WINDOW_MS,
         blocks_per_epoch: 100,
         state_config: StateConfig::default(),
         active_signature_schemes: vec![1, 2],
@@ -918,7 +917,7 @@ async fn a_validator_that_missed_a_payload_recovers_it_from_peers() {
             bls_keys[index].clone(),
             directory.path().join(format!("consensus-{index}")),
             Arc::clone(&status),
-            CoordinatorConfig::default(),
+            pipeline_test_coordinator_config(),
             CoordinatorFaults::default(),
             proposal_source,
             finalized_order_sender,
@@ -1045,7 +1044,7 @@ async fn execution_falling_behind_ordering_is_reported_not_absorbed_silently() {
     let genesis = GenesisDocument {
         format_version: GENESIS_FORMAT_VERSION,
         chain_id: "kestrel-stage2-backpressure-test".to_owned(),
-        genesis_unix_ms: u64::try_from(now).unwrap() + 1_500,
+        genesis_unix_ms: u64::try_from(now).unwrap() + PIPELINE_TEST_GENESIS_STARTUP_WINDOW_MS,
         blocks_per_epoch: 100,
         state_config: StateConfig::default(),
         active_signature_schemes: vec![1, 2],
@@ -1264,7 +1263,7 @@ async fn malformed_gossiped_transaction_does_not_kill_the_pipeline() {
     let genesis = GenesisDocument {
         format_version: GENESIS_FORMAT_VERSION,
         chain_id: "kestrel-stage2-dos-test".to_owned(),
-        genesis_unix_ms: u64::try_from(now).unwrap() + 1_500,
+        genesis_unix_ms: u64::try_from(now).unwrap() + PIPELINE_TEST_GENESIS_STARTUP_WINDOW_MS,
         blocks_per_epoch: 100,
         state_config: StateConfig::default(),
         active_signature_schemes: vec![1, 2],
@@ -1356,7 +1355,7 @@ async fn malformed_gossiped_transaction_does_not_kill_the_pipeline() {
             bls_keys[index].clone(),
             directory.path().join(format!("consensus-{index}")),
             Arc::clone(&status),
-            CoordinatorConfig::default(),
+            pipeline_test_coordinator_config(),
             CoordinatorFaults::default(),
             proposal_source,
             finalized_order_sender,
