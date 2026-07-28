@@ -45,12 +45,15 @@ fn node_binary_commits_an_rpc_submitted_transaction_across_all_processes() {
         rent_balance: 1_000,
     };
 
-    let (genesis, keys, gossip_identities) = fixture_genesis(target.clone());
+    let (genesis, keys, gossip_identities, address_reservations) = fixture_genesis(target.clone());
     genesis
         .write_json(directory.path().join("genesis.json"))
         .unwrap();
     let genesis_path = directory.path().join("genesis.json");
 
+    // Keep the fixture's endpoints unique until every address has been written
+    // to genesis, then release them immediately before the child nodes bind.
+    drop(address_reservations);
     let mut children = Vec::new();
     let mut log_paths = Vec::new();
     for (index, entry) in genesis.validators.iter().enumerate() {
@@ -270,10 +273,16 @@ fn signed_mutation(
 
 fn fixture_genesis(
     initial_object: Object,
-) -> (GenesisDocument, Vec<Vec<u8>>, Vec<identity::Keypair>) {
+) -> (
+    GenesisDocument,
+    Vec<Vec<u8>>,
+    Vec<identity::Keypair>,
+    Vec<TcpListener>,
+) {
     let scheme = Bls12381Scheme;
     let mut keys = Vec::new();
     let mut gossip_identities = Vec::new();
+    let mut address_reservations = Vec::new();
     let validators = (1..=VALIDATOR_COUNT)
         .map(|index| {
             let key = vec![index; 32];
@@ -290,10 +299,13 @@ fn fixture_genesis(
                     public_key,
                     proof_of_possession: scheme.proof_of_possession(&key).unwrap(),
                 },
-                network_address: reserve_address().to_string(),
-                rpc_address: reserve_address().to_string(),
+                network_address: reserve_address(&mut address_reservations).to_string(),
+                rpc_address: reserve_address(&mut address_reservations).to_string(),
                 gossip_peer_id,
-                gossip_address: format!("/ip4/127.0.0.1/tcp/{}", reserve_address().port()),
+                gossip_address: format!(
+                    "/ip4/127.0.0.1/tcp/{}",
+                    reserve_address(&mut address_reservations).port()
+                ),
             }
         })
         .collect();
@@ -316,12 +328,13 @@ fn fixture_genesis(
         },
         keys,
         gossip_identities,
+        address_reservations,
     )
 }
 
-fn reserve_address() -> SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
+fn reserve_address(reservations: &mut Vec<TcpListener>) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    reservations.push(listener);
+    address
 }
