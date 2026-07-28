@@ -608,8 +608,15 @@ impl BlockLifecycle {
             // reports a sensible ordering position, but the coordinator owns it
             // once consensus is running and will be ahead of this.
             status.committed_height = record.height;
-            status.finalized_height = status.finalized_height.max(record.height);
-            status.finalized_block = record.consensus_block_id;
+            // Height and block are one logical pair. During catch-up the
+            // coordinator can already report a much newer finalized height
+            // while execution commits older blocks. Keeping the newer height
+            // but overwriting its block with an older commit made RPC report a
+            // block from height N as though it belonged to height M.
+            if record.height >= status.finalized_height {
+                status.finalized_height = record.height;
+                status.finalized_block = record.consensus_block_id;
+            }
             status.state_root = record.state_root;
             status.ready = true;
         }
@@ -642,6 +649,13 @@ impl BlockLifecycle {
     #[must_use]
     pub const fn committed_height(&self) -> u64 {
         self.committed_height
+    }
+
+    /// Highest finalized block already handed to execution, including a
+    /// durable pending block replayed during startup but not committed yet.
+    #[must_use]
+    pub const fn submitted_height(&self) -> u64 {
+        self.submitted_height
     }
 
     #[must_use]

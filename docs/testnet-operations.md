@@ -47,7 +47,42 @@ Health surfaces:
 - `GET /metrics` exports Prometheus text.
 - `POST /` accepts JSON-RPC `kestrel_getStatus` and `kestrel_getObject`.
 
-Defaults cap bodies at 512 KiB, batches at 64 calls, and each source IP at 1,000 requests per second. No administrative or chaos method is exposed by public RPC.
+Defaults cap bodies at 512 KiB, batches at 64 calls, and each source IP at 1,000 JSON-RPC calls per second. Every element in a batch consumes one call from that allowance; a batch is not counted as a single request. No administrative or chaos method is exposed by public RPC.
+
+### RPC load and abuse evidence
+
+Run the bounded read-only harness against a loopback node:
+
+```sh
+python3 scripts/rpc_load_abuse.py \
+  --url http://127.0.0.1:8899/ \
+  --duration-seconds 30 \
+  --requests-per-second 250 \
+  --concurrency 16 \
+  --max-p95-ms 250 \
+  --output evidence/rpc-load-abuse.json
+```
+
+The paced workload uses `kestrel_getStatus` only and reports achieved call rate,
+success ratio, and p50/p95/p99/max latency. Bounded abuse probes verify malformed
+JSON errors, the configured batch and body limits, responsiveness while partial
+request bodies are held open, exact fixed-window rate-limit exhaustion, and
+Prometheus request/error/rejection counter deltas. The output path is immutable:
+the harness refuses to overwrite existing evidence.
+
+The defaults assume the node's default 512 KiB body, 64-call batch, one-second
+window, and 1,000-call per-source limit. If the target uses different settings,
+pass the matching `--maximum-body-bytes`, `--maximum-batch-length`,
+`--rate-window-seconds`, and `--rate-limit-calls` values. Set
+`--rate-limit-calls 0` only when the target's edge proxy makes deterministic
+limit exhaustion impossible; the report records that probe as skipped.
+
+Non-loopback targets are refused unless `--allow-non-loopback` is supplied.
+That flag is authorization acknowledgement, not permission to test a public
+endpoint: use it only for infrastructure the operator controls, agree the load
+envelope in advance, and keep the offered call rate below upstream proxy and
+provider limits. The harness never submits transactions or calls administrative
+or chaos methods.
 
 ## Chaos campaigns
 
@@ -60,6 +95,75 @@ cargo run -p testkit --example phase_6_report
 For an external testnet, implement `testkit::ChaosTarget` in the operator-controlled deployment repository. The adapter maps `KillValidator`, `IsolateValidator`, message-drop, and `HealAll` requests to narrowly scoped infrastructure controls and returns finalized height/hash observations from independent nodes. `run_external` fails immediately on conflicting finalized hashes, fails after the configured number of stalled observations, and requests healing on success and error paths.
 
 Never point a chaos adapter at mainnet or a network outside the operator's explicit authority. Start Stage 2 with team-controlled machines and a written rollback procedure.
+
+## Stage 2 distributed campaign evidence
+
+Use `testnets/configs/stage2-campaign.example.json` as the public,
+provider-neutral campaign manifest. Each validator entry binds its genesis
+validator ID to an HTTPS RPC endpoint and the structured JSON log copied from
+that validator after the run. Stake is derived from the declared genesis
+document (an optional manifest `stake` must match it), never trusted from a
+free-standing label. Do not put SSH destinations, credentials, private
+addresses, or secret-key paths in a committed manifest.
+
+Before measuring propagation, synchronize every host clock with the operator's
+normal NTP/PTP service and record the observed maximum skew in the private
+campaign notes. Propagation is computed by correlating the same signed
+transaction ID across validator log timestamps, so unsynchronized clocks make
+that measurement invalid. Start validators with transaction-admission tracing
+enabled:
+
+```sh
+RUST_LOG='info,node=debug,node::pipeline=trace' target/release/node run ...
+```
+
+Run the read-only monitor from an operator host for the initial six-hour
+campaign:
+
+```sh
+python3 scripts/stage2_campaign_monitor.py \
+  --manifest testnets/configs/stage2-campaign.json \
+  --duration-seconds 21600 \
+  --interval-seconds 2 \
+  --stall-seconds 45 \
+  --output evidence/observations.jsonl \
+  --summary evidence/monitor-summary.json
+```
+
+It polls all RPC endpoints concurrently, verifies chain and genesis identity,
+remembers every observed `(height, block)` decision, fails immediately on a
+conflict, and fails if the maximum finalized height remains stationary beyond
+the bound. It never starts, stops, partitions, or reconfigures a validator;
+authorized fault mutation remains in the deployment repository's
+`testkit::ChaosTarget` adapter.
+
+After the run, copy each validator's complete JSON log to the path declared in
+the manifest and compile the immutable evidence:
+
+```sh
+python3 scripts/stage2_campaign_report.py \
+  --manifest testnets/configs/stage2-campaign.json \
+  --output evidence/stage2-report.json \
+  --markdown evidence/stage2-report.md
+```
+
+The report:
+
+- hashes every input log with SHA-256;
+- verifies every validator started from the declared genesis;
+- fails on conflicting finalized blocks or a stopped coordinator/pipeline;
+- computes time from first admission to the configured stake threshold
+  (80% by default);
+- summarizes node-observed finality latency, cross-validator finalization skew,
+  view changes, and execution lag; and
+- applies only the explicit gates in the manifest. Latency targets are not
+  silently invented: record the real numbers first, then compare them honestly
+  with the research targets.
+
+Retain the raw logs, monitor observations, manifest, report, genesis, binary
+digest, host/region inventory, clock-skew evidence, fault timeline, and rollback
+record together. Publish only a redacted evidence bundle that does not expose
+operator credentials or private infrastructure details.
 
 ## Promotion checklist
 

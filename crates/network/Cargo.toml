@@ -15,6 +15,7 @@ reed-solomon-erasure.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 types.workspace = true
 
 [dev-dependencies]

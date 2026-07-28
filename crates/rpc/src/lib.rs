@@ -234,7 +234,7 @@ impl RpcService {
         .await
     }
 
-    fn allow(&self, address: IpAddr) -> Result<bool, RpcError> {
+    fn allow(&self, address: IpAddr, request_count: u32) -> Result<bool, RpcError> {
         let mut windows = self
             .inner
             .limiter
@@ -253,10 +253,10 @@ impl RpcService {
                 requests: 0,
             };
         }
-        if window.requests >= self.inner.config.requests_per_window {
+        if window.requests.saturating_add(request_count) > self.inner.config.requests_per_window {
             return Ok(false);
         }
-        window.requests += 1;
+        window.requests += request_count;
         Ok(true)
     }
 }
@@ -290,8 +290,22 @@ async fn json_rpc(
         .metrics
         .requests
         .fetch_add(1, Ordering::Relaxed);
+    let parsed = serde_json::from_slice::<Value>(&bytes);
+    // A batch is multiple independent JSON-RPC calls and must consume the same
+    // rate-limit budget as sending those calls in separate HTTP requests.
+    // Invalid and over-limit envelopes still cost one unit, preventing free
+    // parser abuse without allowing an oversized batch to overflow the counter.
+    let request_count = match &parsed {
+        Ok(Value::Array(requests))
+            if !requests.is_empty()
+                && requests.len() <= service.inner.config.maximum_batch_length =>
+        {
+            u32::try_from(requests.len()).unwrap_or(u32::MAX)
+        }
+        _ => 1,
+    };
     let address = connection.ip();
-    if !matches!(service.allow(address), Ok(true)) {
+    if !matches!(service.allow(address, request_count), Ok(true)) {
         service
             .inner
             .metrics
@@ -300,7 +314,7 @@ async fn json_rpc(
         return (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response();
     }
 
-    let response = match serde_json::from_slice::<Value>(&bytes) {
+    let response = match parsed {
         Ok(Value::Array(requests)) if requests.is_empty() => {
             error_response(&Value::Null, -32600, "invalid request")
         }
@@ -323,7 +337,7 @@ async fn json_rpc(
         Ok(request) => dispatch(&service, request),
         Err(_) => error_response(&Value::Null, -32700, "parse error"),
     };
-    if response.get("error").is_some() {
+    if response_has_error(&response) {
         service.inner.metrics.errors.fetch_add(1, Ordering::Relaxed);
     }
     let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -333,6 +347,13 @@ async fn json_rpc(
         .latency_micros
         .fetch_add(elapsed, Ordering::Relaxed);
     axum::Json(response).into_response()
+}
+
+fn response_has_error(response: &Value) -> bool {
+    response.get("error").is_some()
+        || response
+            .as_array()
+            .is_some_and(|responses| responses.iter().any(|item| item.get("error").is_some()))
 }
 
 fn dispatch(service: &RpcService, value: Value) -> Value {
@@ -557,6 +578,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(limited.status(), 429);
+    }
+
+    #[tokio::test]
+    async fn rpc_batches_consume_one_rate_limit_unit_per_call() {
+        let (service, _object) = fixture(RpcConfig {
+            requests_per_window: 3,
+            ..RpcConfig::default()
+        });
+        let router = service.router();
+        let batch = request(
+            router.clone(),
+            r#"[{"jsonrpc":"2.0","method":"kestrel_getStatus","id":1},{"jsonrpc":"2.0","method":"missing","id":2}]"#.to_owned(),
+        )
+        .await;
+        assert_eq!(batch.as_array().unwrap().len(), 2);
+
+        let single = request(
+            router.clone(),
+            r#"{"jsonrpc":"2.0","method":"kestrel_getStatus","id":3}"#.to_owned(),
+        )
+        .await;
+        assert!(single.get("result").is_some());
+
+        let limited = router
+            .oneshot(
+                Request::post("/")
+                    .header("content-type", "application/json")
+                    .extension(axum::extract::ConnectInfo(SocketAddr::from((
+                        [127, 0, 0, 1],
+                        1,
+                    ))))
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","method":"kestrel_getStatus","id":4}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), 429);
+
+        let status = service.inner.status.read().unwrap();
+        let metrics = service.metrics().render(&status);
+        assert!(metrics.contains("kestrel_rpc_errors_total 1"));
+        assert!(metrics.contains("kestrel_rpc_rejected_total 1"));
     }
 
     async fn request(router: axum::Router, body: String) -> serde_json::Value {

@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "campaign": "stage2-private-devnet-YYYY-MM-DD",
+  "chain_id": "kestrel-stage2",
+  "genesis": "REPLACE_WITH_PATH_TO_GENESIS_JSON",
+  "genesis_hash": "REPLACE_WITH_CANONICAL_GENESIS_HASH",
+  "propagation_stake_threshold": 0.8,
+  "measured_maximum_clock_skew_ms": 5,
+  "validators": [
+    {
+      "name": "validator-eu-west",
+      "validator_id": "REPLACE_WITH_VALIDATOR_ID",
+      "stake": 20,
+      "rpc": "https://validator-eu-west.example.test/",
+      "log": "../../evidence/validator-eu-west.jsonl"
+    },
+    {
+      "name": "validator-us-east",
+      "validator_id": "REPLACE_WITH_VALIDATOR_ID",
+      "stake": 20,
+      "rpc": "https://validator-us-east.example.test/",
+      "log": "../../evidence/validator-us-east.jsonl"
+    },
+    {
+      "name": "validator-us-west",
+      "validator_id": "REPLACE_WITH_VALIDATOR_ID",
+      "stake": 20,
+      "rpc": "https://validator-us-west.example.test/",
+      "log": "../../evidence/validator-us-west.jsonl"
+    },
+    {
+      "name": "validator-ap-southeast",
+      "validator_id": "REPLACE_WITH_VALIDATOR_ID",
+      "stake": 20,
+      "rpc": "https://validator-ap-southeast.example.test/",
+      "log": "../../evidence/validator-ap-southeast.jsonl"
+    }
+  ],
+  "gates": {
+    "min_propagation_samples": 100,
+    "min_finality_samples": 100,
+    "max_incomplete_propagation": 0,
+    "max_malformed_log_lines": 0,
+    "max_clock_skew_ms": 10,
+    "max_execution_lag": 1
+  }
+}

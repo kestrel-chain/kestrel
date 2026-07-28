@@ -43,7 +43,10 @@ status() { curl -s -m 2 "127.0.0.1:$(rpc_port "$1")/" \
 start_node() { # start_node N [extra flags...]
   local n="$1"; shift
   local id; id="$(id_hex "$n")"
-  RUST_LOG="${RUST_LOG:-info,node=debug}" target/release/node run \
+  # Do not inherit an ambient RUST_LOG (the Codex/dev shell commonly sets it
+  # to `warn`): that silently removes the round/view diagnostics this harness
+  # needs to explain a liveness failure. Use a soak-specific override instead.
+  RUST_LOG="${KESTREL_SOAK_RUST_LOG:-info,node=debug}" target/release/node run \
     --genesis devnet/genesis.json --rpc "127.0.0.1:$(rpc_port "$n")" \
     --validator-id "$id" --validator-key "devnet/v$n/validator.key" \
     --gossip-key "devnet/v$n/gossip.key" --data-dir "devnet/v$n/data" \
@@ -74,7 +77,11 @@ trap cleanup EXIT INT TERM
 
 # ---- build + fresh chain ---------------------------------------------------
 echo "building release binaries..."
-cargo build --release -p node --example submit_tx --quiet || { echo "build failed"; exit 1; }
+# Must name --bin node explicitly: `--example` alone rebuilds the library but
+# NOT the node binary the soak actually runs, which would silently test a stale
+# build.
+cargo build --release -p node --bin node --example submit_tx --quiet \
+  || { echo "build failed"; exit 1; }
 pkill -9 -f 'target/release/node run' 2>/dev/null; sleep 1
 rm -rf "$RUN"; mkdir -p "$RUN"
 for n in $(seq 1 "$NODES"); do rm -rf "devnet/v$n/data"; : > "$RUN/v$n.log"; done

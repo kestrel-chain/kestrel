@@ -70,10 +70,12 @@ async fn main() -> Result<()> {
     );
     let submitter: Option<Arc<dyn TransactionSubmitter>>;
     let rpc_state: Arc<RwLock<StateTree>>;
+    let running_validator_id;
     if let (Some(id), Some(key_path), Some(gossip_key_path), Some(data_directory)) =
         validator_identity
     {
         let id = parse_hash(id)?;
+        running_validator_id = Some(id);
         let private_key = hex::decode(
             std::fs::read_to_string(key_path)
                 .context("failed to read validator key")?
@@ -218,6 +220,7 @@ async fn main() -> Result<()> {
             "--validator-id, --validator-key, --gossip-key, and --data-dir must be supplied together"
         );
     } else {
+        running_validator_id = None;
         let mut state = StateTree::new(genesis.state_config)?;
         for object in &genesis.initial_objects {
             state.create_object(object.clone())?;
@@ -242,7 +245,16 @@ async fn main() -> Result<()> {
     let service = RpcService::new(rpc_config, Arc::clone(&status), rpc_state, submitter)?;
 
     let listener = TcpListener::bind(rpc_address).await?;
-    info!(%rpc_address, genesis = %validated.genesis_hash, "validator RPC ready");
+    if let Some(validator_id) = running_validator_id {
+        info!(
+            %rpc_address,
+            genesis = %validated.genesis_hash,
+            %validator_id,
+            "validator RPC ready"
+        );
+    } else {
+        info!(%rpc_address, genesis = %validated.genesis_hash, "validator RPC ready");
+    }
     service
         .serve(listener, async {
             let _ = tokio::signal::ctrl_c().await;
