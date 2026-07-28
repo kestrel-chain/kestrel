@@ -567,15 +567,17 @@ impl ConsensusCoordinator {
             let block_id = proposal.proposal.block_id;
             let proposal_transaction_ids = proposal.proposal.transaction_ids.clone();
             let proposal_fee_commitment = proposal.proposal.fee_commitment;
-            if let Some(certificate) = make_certificate(
-                &self.validators,
-                Arc::clone(&self.scheme),
-                CertificateKind::Fast,
-                height,
-                view,
-                block_id,
-                &round.order_votes,
-            ) {
+            if round.fast_votes_changed()
+                && let Some(certificate) = make_certificate(
+                    &self.validators,
+                    Arc::clone(&self.scheme),
+                    CertificateKind::Fast,
+                    height,
+                    view,
+                    block_id,
+                    &round.order_votes,
+                )
+            {
                 let transaction_ids = proposal_transaction_ids.clone();
                 self.broadcast(WireMessage::Certificate {
                     certificate: certificate.clone(),
@@ -592,6 +594,7 @@ impl ConsensusCoordinator {
             }
             if !round.has(RoundFlag::PrepareSent)
                 && round.started.elapsed() >= self.config.fast_path_wait
+                && round.prepare_votes_changed()
                 && let Some(certificate) = make_certificate(
                     &self.validators,
                     Arc::clone(&self.scheme),
@@ -611,15 +614,17 @@ impl ConsensusCoordinator {
                 .await;
                 self.apply_prepare(&certificate, round).await?;
             }
-            if let Some(certificate) = make_certificate(
-                &self.validators,
-                Arc::clone(&self.scheme),
-                CertificateKind::Commit,
-                height,
-                view,
-                block_id,
-                &round.commit_votes,
-            ) {
+            if round.commit_votes_changed()
+                && let Some(certificate) = make_certificate(
+                    &self.validators,
+                    Arc::clone(&self.scheme),
+                    CertificateKind::Commit,
+                    height,
+                    view,
+                    block_id,
+                    &round.commit_votes,
+                )
+            {
                 let transaction_ids = proposal_transaction_ids;
                 self.broadcast(WireMessage::Certificate {
                     certificate: certificate.clone(),
@@ -666,15 +671,17 @@ impl ConsensusCoordinator {
                 self.broadcast(WireMessage::Vote(vote)).await;
             }
         }
-        if let Some(certificate) = make_certificate(
-            &self.validators,
-            Arc::clone(&self.scheme),
-            CertificateKind::Timeout,
-            height,
-            view,
-            Hash::default(),
-            &round.timeout_votes,
-        ) {
+        if round.timeout_votes_changed()
+            && let Some(certificate) = make_certificate(
+                &self.validators,
+                Arc::clone(&self.scheme),
+                CertificateKind::Timeout,
+                height,
+                view,
+                Hash::default(),
+                &round.timeout_votes,
+            )
+        {
             self.broadcast(WireMessage::Certificate {
                 certificate: certificate.clone(),
                 transaction_ids: None,
@@ -1192,6 +1199,10 @@ struct RoundState {
     order_votes: BTreeMap<Hash, Vote>,
     commit_votes: BTreeMap<Hash, Vote>,
     timeout_votes: BTreeMap<Hash, Vote>,
+    last_fast_vote_count: Option<usize>,
+    last_prepare_vote_count: Option<usize>,
+    last_commit_vote_count: Option<usize>,
+    last_timeout_vote_count: Option<usize>,
     flags: BTreeSet<RoundFlag>,
 }
 
@@ -1231,6 +1242,10 @@ impl RoundState {
             order_votes: BTreeMap::new(),
             commit_votes: BTreeMap::new(),
             timeout_votes: BTreeMap::new(),
+            last_fast_vote_count: None,
+            last_prepare_vote_count: None,
+            last_commit_vote_count: None,
+            last_timeout_vote_count: None,
             flags: BTreeSet::new(),
         }
     }
@@ -1254,6 +1269,30 @@ impl RoundState {
         self.proposal
             .clone()
             .or_else(|| self.observed_proposals.values().next().cloned())
+    }
+
+    fn fast_votes_changed(&mut self) -> bool {
+        Self::record_vote_count(&mut self.last_fast_vote_count, self.order_votes.len())
+    }
+
+    fn prepare_votes_changed(&mut self) -> bool {
+        Self::record_vote_count(&mut self.last_prepare_vote_count, self.order_votes.len())
+    }
+
+    fn commit_votes_changed(&mut self) -> bool {
+        Self::record_vote_count(&mut self.last_commit_vote_count, self.commit_votes.len())
+    }
+
+    fn timeout_votes_changed(&mut self) -> bool {
+        Self::record_vote_count(&mut self.last_timeout_vote_count, self.timeout_votes.len())
+    }
+
+    fn record_vote_count(previous: &mut Option<usize>, current: usize) -> bool {
+        if *previous == Some(current) {
+            return false;
+        }
+        *previous = Some(current);
+        true
     }
 
     fn has(&self, flag: RoundFlag) -> bool {
@@ -1371,7 +1410,7 @@ mod tests {
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
-    use consensus::Validator;
+    use consensus::{Validator, Vote, VotePhase};
     use crypto::{Bls12381Scheme, SignatureScheme};
     use rpc::NodeStatus;
     use tempfile::TempDir;
@@ -1448,6 +1487,55 @@ mod tests {
 
         post_commit.height_started = Instant::now().checked_sub(margin).unwrap();
         assert!(!post_commit.should_defer_empty_proposal(margin, true));
+    }
+
+    #[test]
+    fn certificate_aggregation_retries_only_after_its_vote_set_changes() {
+        let mut round = super::RoundState::new();
+        assert!(round.fast_votes_changed());
+        assert!(!round.fast_votes_changed());
+        assert!(round.prepare_votes_changed());
+        assert!(!round.prepare_votes_changed());
+
+        let order_vote = Vote {
+            validator: Hash::digest(b"order-voter"),
+            height: 1,
+            view: 0,
+            block_id: Hash::digest(b"block"),
+            phase: VotePhase::Order,
+            signature: vec![1],
+        };
+        round
+            .order_votes
+            .insert(order_vote.validator, order_vote.clone());
+        assert!(round.fast_votes_changed());
+        assert!(round.prepare_votes_changed());
+        assert!(!round.fast_votes_changed());
+        assert!(!round.prepare_votes_changed());
+
+        let commit_vote = Vote {
+            phase: VotePhase::Commit,
+            ..order_vote
+        };
+        round
+            .commit_votes
+            .insert(commit_vote.validator, commit_vote);
+        assert!(round.commit_votes_changed());
+        assert!(!round.commit_votes_changed());
+
+        let timeout_vote = Vote {
+            validator: Hash::digest(b"timeout-voter"),
+            height: 1,
+            view: 0,
+            block_id: Hash::default(),
+            phase: VotePhase::Timeout,
+            signature: vec![2],
+        };
+        round
+            .timeout_votes
+            .insert(timeout_vote.validator, timeout_vote);
+        assert!(round.timeout_votes_changed());
+        assert!(!round.timeout_votes_changed());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
