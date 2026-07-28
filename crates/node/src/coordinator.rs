@@ -1414,8 +1414,9 @@ mod tests {
     async fn five_real_tcp_nodes_finalize_the_same_two_heights() {
         let _serialised = REAL_TCP_TESTS.lock().await;
         let directory = TempDir::new().unwrap();
-        let (genesis, keys) = fixture_genesis(5);
+        let (genesis, keys, address_reservations) = fixture_genesis(5);
         let validated = genesis.validate().unwrap();
+        drop(address_reservations);
         let mut tasks = Vec::new();
         let mut finalized_orders = Vec::new();
         for (index, entry) in genesis.validators.iter().enumerate() {
@@ -1534,7 +1535,7 @@ mod tests {
     async fn real_tcp_nodes_recover_after_leader_kill_with_a_corrupt_voter() {
         let _serialised = REAL_TCP_TESTS.lock().await;
         let directory = TempDir::new().unwrap();
-        let (mut genesis, keys) = fixture_genesis(5);
+        let (mut genesis, keys, address_reservations) = fixture_genesis(5);
         let initial = genesis.validate().unwrap();
         let leader = initial.validators.leader(1, 0).id;
         let corrupt = genesis
@@ -1560,6 +1561,7 @@ mod tests {
         let validated = genesis.validate().unwrap();
         assert_eq!(validated.validators.validator(leader).unwrap().stake, 20);
         assert_eq!(validated.validators.validator(corrupt).unwrap().stake, 10);
+        drop(address_reservations);
 
         let mut tasks = Vec::new();
         for (index, entry) in genesis.validators.iter().enumerate() {
@@ -1656,11 +1658,12 @@ mod tests {
     async fn timeout_quorum_advances_without_the_next_view_leader() {
         let _serialised = REAL_TCP_TESTS.lock().await;
         let directory = TempDir::new().unwrap();
-        let (genesis, keys) = fixture_genesis(5);
+        let (genesis, keys, address_reservations) = fixture_genesis(5);
         let validated = genesis.validate().unwrap();
         let initial_leader = validated.validators.leader(1, 0).id;
         let missing_next_leader = validated.validators.leader(1, 1).id;
         assert_ne!(initial_leader, missing_next_leader);
+        drop(address_reservations);
 
         let mut tasks = Vec::new();
         for (index, entry) in genesis.validators.iter().enumerate() {
@@ -1741,8 +1744,9 @@ mod tests {
         const LATE: usize = 4;
         let _serialised = REAL_TCP_TESTS.lock().await;
         let directory = TempDir::new().unwrap();
-        let (genesis, keys) = fixture_genesis(5);
+        let (genesis, keys, address_reservations) = fixture_genesis(5);
         let validated = genesis.validate().unwrap();
+        drop(address_reservations);
 
         let mut peer_tasks = Vec::new();
         let mut late_task = None;
@@ -1827,9 +1831,10 @@ mod tests {
         drop(receivers);
     }
 
-    fn fixture_genesis(count: u8) -> (GenesisDocument, Vec<Vec<u8>>) {
+    fn fixture_genesis(count: u8) -> (GenesisDocument, Vec<Vec<u8>>, Vec<StdTcpListener>) {
         let scheme = Bls12381Scheme;
         let mut keys = Vec::new();
+        let mut address_reservations = Vec::new();
         let validators = (1..=count)
             .map(|index| {
                 let key = vec![index; 32];
@@ -1845,10 +1850,13 @@ mod tests {
                         public_key,
                         proof_of_possession: scheme.proof_of_possession(&key).unwrap(),
                     },
-                    network_address: reserve_address().to_string(),
-                    rpc_address: reserve_address().to_string(),
+                    network_address: reserve_address(&mut address_reservations).to_string(),
+                    rpc_address: reserve_address(&mut address_reservations).to_string(),
                     gossip_peer_id: gossip_identity.public().to_peer_id().to_string(),
-                    gossip_address: format!("/ip4/127.0.0.1/tcp/{}", reserve_address().port()),
+                    gossip_address: format!(
+                        "/ip4/127.0.0.1/tcp/{}",
+                        reserve_address(&mut address_reservations).port()
+                    ),
                 }
             })
             .collect();
@@ -1870,11 +1878,14 @@ mod tests {
                 initial_fee_balances: BTreeMap::new(),
             },
             keys,
+            address_reservations,
         )
     }
 
-    fn reserve_address() -> std::net::SocketAddr {
+    fn reserve_address(reservations: &mut Vec<StdTcpListener>) -> std::net::SocketAddr {
         let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap()
+        let address = listener.local_addr().unwrap();
+        reservations.push(listener);
+        address
     }
 }
