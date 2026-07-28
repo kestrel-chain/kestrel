@@ -393,6 +393,15 @@ async fn stage2_pipeline_commits_many_independent_transactions_concurrently() {
 
 #[allow(clippy::too_many_lines)] // Keep the full multi-node wiring/assertion timeline auditable.
 async fn run_concurrent_independent_senders(transaction_count: usize) {
+    // This fixture opens eight RocksDB databases and binds both libp2p and
+    // consensus transports before the coordinator tasks can enter
+    // `wait_for_genesis`. A 1.5-second lead is already gone on a cold two-core
+    // CI runner, letting the first scheduled validator time out before all
+    // peers are listening. This test measures concurrent transaction
+    // correctness, not startup latency, so give every listener a deterministic
+    // pre-genesis window.
+    const GENESIS_STARTUP_WINDOW_MS: u64 = 10_000;
+
     let log = captured_log();
     let directory = TempDir::new().unwrap();
 
@@ -453,7 +462,7 @@ async fn run_concurrent_independent_senders(transaction_count: usize) {
     let genesis = GenesisDocument {
         format_version: GENESIS_FORMAT_VERSION,
         chain_id: "kestrel-stage2-concurrent-test".to_owned(),
-        genesis_unix_ms: u64::try_from(now).unwrap() + 1_500,
+        genesis_unix_ms: u64::try_from(now).unwrap() + GENESIS_STARTUP_WINDOW_MS,
         blocks_per_epoch: 100,
         state_config: StateConfig::default(),
         active_signature_schemes: vec![1, 2],
@@ -547,7 +556,15 @@ async fn run_concurrent_independent_senders(transaction_count: usize) {
             bls_keys[index].clone(),
             directory.path().join(format!("consensus-{index}")),
             Arc::clone(&status),
-            CoordinatorConfig::default(),
+            CoordinatorConfig {
+                // The default 300 ms bound is appropriate for a warm local
+                // network, but three sequential TCP sends can each consume the
+                // 250 ms connect timeout on a contended debug runner. Avoid
+                // turning scheduler delay into a protocol fault in this
+                // throughput/correctness test.
+                round_timeout: Duration::from_secs(2),
+                ..CoordinatorConfig::default()
+            },
             CoordinatorFaults::default(),
             proposal_source,
             finalized_order_sender,
