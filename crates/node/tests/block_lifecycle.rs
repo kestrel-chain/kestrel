@@ -10,7 +10,7 @@ use consensus::{
 };
 use crypto::{AggregateSignatureScheme, Bls12381Scheme, Ed25519Scheme, SignatureScheme};
 use execution::{
-    AccessMode, DeclaredObjectRef, ExecutableTransaction, MoveOperation,
+    AccessMode, DeclaredObjectRef, ExecutableTransaction, ExecutionStatus, MoveOperation,
     NATIVE_OPERATION_COMPUTE_COST,
 };
 use network::KestrelCastConfig;
@@ -137,6 +137,125 @@ fn reconstructed_signed_block_executes_commits_and_restores_after_restart() {
     assert_eq!(
         shared_state.read().unwrap().object(&first.id).unwrap().data,
         vec![21]
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)] // Keep poison transaction, receipt, restart, and continuation together.
+fn failed_transaction_reverts_without_poisoning_the_finalized_block_or_restart() {
+    let directory = TempDir::new().unwrap();
+    let account_key = [77_u8; 32];
+    let account_scheme = Ed25519Scheme;
+    let account_public_key = account_scheme.public_key(&account_key).unwrap();
+    let owner = account_scheme.address(&account_public_key).unwrap();
+    let existing = object(1, owner);
+    let missing = object(2, owner);
+    let (genesis, validator_keys) = genesis(vec![existing.clone()]);
+    let validated = genesis.validate().unwrap();
+    let status = status(&genesis, validated.genesis_hash, validated.state_root);
+    let shared_state = Arc::new(RwLock::new(StateTree::new(StateConfig::default()).unwrap()));
+
+    let first_payload = PropagatedBlock {
+        height: 1,
+        parent_id: validated.genesis_hash,
+        transactions: vec![
+            signed_mutation(&account_key, &account_public_key, owner, 0, &missing, 0, 99),
+            signed_mutation(
+                &account_key,
+                &account_public_key,
+                owner,
+                1,
+                &existing,
+                0,
+                11,
+            ),
+        ],
+        base_fees: vec![0, 0],
+    };
+    let first_record = {
+        let mut lifecycle = BlockLifecycle::open(
+            &genesis,
+            directory.path(),
+            Arc::clone(&status),
+            Arc::clone(&shared_state),
+            100,
+            4,
+        )
+        .unwrap();
+        lifecycle
+            .submit_payload(
+                finalized_order(&genesis, &validator_keys, &first_payload),
+                &first_payload,
+            )
+            .unwrap();
+        let record = wait_for_commit(&mut lifecycle);
+        assert_eq!(record.height, 1);
+        assert!(matches!(
+            lifecycle.receipt(1, 0).unwrap().unwrap().status,
+            ExecutionStatus::Failed(_)
+        ));
+        assert!(matches!(
+            lifecycle.receipt(1, 1).unwrap().unwrap().status,
+            ExecutionStatus::Succeeded
+        ));
+        assert_eq!(lifecycle.admission_nonces().get(&owner), Some(&2));
+        let state = shared_state.read().unwrap();
+        assert!(state.object(&missing.id).is_none());
+        assert_eq!(state.object(&existing.id).unwrap().data, vec![11]);
+        record
+    };
+
+    let mut lifecycle = BlockLifecycle::open(
+        &genesis,
+        directory.path(),
+        Arc::clone(&status),
+        Arc::clone(&shared_state),
+        100,
+        4,
+    )
+    .unwrap();
+    assert_eq!(lifecycle.committed_height(), 1);
+    assert!(matches!(
+        lifecycle.receipt(1, 0).unwrap().unwrap().status,
+        ExecutionStatus::Failed(_)
+    ));
+    assert_eq!(lifecycle.admission_nonces().get(&owner), Some(&2));
+
+    let existing_after = shared_state
+        .read()
+        .unwrap()
+        .object(&existing.id)
+        .unwrap()
+        .clone();
+    let second_payload = PropagatedBlock {
+        height: 2,
+        parent_id: first_record.consensus_block_id,
+        transactions: vec![signed_mutation(
+            &account_key,
+            &account_public_key,
+            owner,
+            2,
+            &existing_after,
+            1,
+            22,
+        )],
+        base_fees: vec![0],
+    };
+    lifecycle
+        .submit_payload(
+            finalized_order(&genesis, &validator_keys, &second_payload),
+            &second_payload,
+        )
+        .unwrap();
+    assert_eq!(wait_for_commit(&mut lifecycle).height, 2);
+    assert_eq!(
+        shared_state
+            .read()
+            .unwrap()
+            .object(&existing.id)
+            .unwrap()
+            .data,
+        vec![22]
     );
 }
 
@@ -347,6 +466,68 @@ fn finalized_block_submitted_before_a_crash_still_commits_after_restart() {
         shared_state.read().unwrap().object(&first.id).unwrap().data,
         vec![42]
     );
+}
+
+#[test]
+fn failed_finalized_transaction_replays_as_a_receipt_after_crash() {
+    let directory = TempDir::new().unwrap();
+    let account_key = [8_u8; 32];
+    let account_public_key = Ed25519Scheme.public_key(&account_key).unwrap();
+    let owner = Ed25519Scheme.address(&account_public_key).unwrap();
+    let missing = object(8, owner);
+    let (genesis, validator_keys) = genesis(Vec::new());
+    let validated = genesis.validate().unwrap();
+    let status = status(&genesis, validated.genesis_hash, validated.state_root);
+    let shared_state = Arc::new(RwLock::new(StateTree::new(StateConfig::default()).unwrap()));
+    let payload = PropagatedBlock {
+        height: 1,
+        parent_id: validated.genesis_hash,
+        transactions: vec![signed_mutation(
+            &account_key,
+            &account_public_key,
+            owner,
+            0,
+            &missing,
+            0,
+            42,
+        )],
+        base_fees: vec![0],
+    };
+    let order = finalized_order(&genesis, &validator_keys, &payload);
+
+    {
+        let mut lifecycle = BlockLifecycle::open(
+            &genesis,
+            directory.path(),
+            Arc::clone(&status),
+            Arc::clone(&shared_state),
+            100,
+            4,
+        )
+        .unwrap();
+        lifecycle.submit_payload(order, &payload).unwrap();
+        // Crash before observing the deterministic execution failure. The
+        // pending finalized block must replay into a failed receipt, not fail
+        // the worker again forever.
+    }
+
+    let mut lifecycle = BlockLifecycle::open(
+        &genesis,
+        directory.path(),
+        Arc::clone(&status),
+        Arc::clone(&shared_state),
+        100,
+        4,
+    )
+    .unwrap();
+    assert_eq!(lifecycle.submitted_height(), 1);
+    assert_eq!(wait_for_commit(&mut lifecycle).height, 1);
+    assert!(matches!(
+        lifecycle.receipt(1, 0).unwrap().unwrap().status,
+        ExecutionStatus::Failed(_)
+    ));
+    assert!(shared_state.read().unwrap().object(&missing.id).is_none());
+    assert_eq!(lifecycle.admission_nonces().get(&owner), Some(&1));
 }
 
 #[test]

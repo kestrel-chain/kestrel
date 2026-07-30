@@ -180,7 +180,7 @@ struct Sender {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[allow(clippy::too_many_lines)] // Keep the full multi-node wiring/assertion timeline auditable.
-async fn stage2_pipeline_commits_a_gossiped_transaction_across_all_nodes() {
+async fn stage2_pipeline_commits_after_a_semantically_failing_gossiped_transaction() {
     let _test_guard = PIPELINE_TEST_LOCK.lock().await;
     let directory = TempDir::new().unwrap();
     let account_key = [7_u8; 32];
@@ -346,13 +346,57 @@ async fn stage2_pipeline_commits_a_gossiped_transaction_across_all_nodes() {
     // Let the gossip mesh dial and stabilize before genesis time arrives.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let transaction = signed_mutation(&account_key, &account_public_key, owner, 0, &target, 0, 42);
-    handles[0].submit_transaction(transaction).unwrap();
+    // The first envelope is correctly signed and nonce-valid, but references
+    // an object absent from canonical state. It must finalize as a failed
+    // receipt rather than killing every validator. The following nonce must
+    // still execute and converge across the full production composition.
+    let missing = Object {
+        id: Hash::digest(b"stage2-missing-object"),
+        data: vec![99],
+        ..target.clone()
+    };
+    handles[0]
+        .submit_transaction(signed_mutation(
+            &account_key,
+            &account_public_key,
+            owner,
+            0,
+            &missing,
+            0,
+            99,
+        ))
+        .unwrap();
 
     // 45s, not 20s: this fixture runs four full tokio multi-threaded
     // runtimes with real libp2p/BLS, and a busy shared CI runner has been
     // observed to need far longer than the ~1.6s this takes locally.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if statuses
+            .iter()
+            .all(|status| status.read().unwrap().committed_height >= 1)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "failed transaction did not commit on all nodes in time"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let followup = signed_mutation(&account_key, &account_public_key, owner, 1, &target, 0, 42);
+    loop {
+        if handles[0].submit_transaction(followup.clone()).is_ok() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "failed transaction was not retired from sender admission"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
     loop {
         let all_committed = object_states.iter().all(|state| {
             state

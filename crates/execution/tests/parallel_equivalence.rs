@@ -1,6 +1,6 @@
 use execution::{
-    AccessMode, DeclaredObjectRef, ExecutableTransaction, ExecutionPath, MoveOperation,
-    ParallelExecutor, SequentialExecutor,
+    AccessMode, DeclaredObjectRef, ExecutableTransaction, ExecutionFailure, ExecutionPath,
+    ExecutionStatus, MoveOperation, ParallelExecutor, SequentialExecutor,
 };
 use proptest::prelude::*;
 use state::{StateConfig, StateTree};
@@ -250,7 +250,7 @@ fn scheduler_reports_fast_path_and_conflict_reexecution() {
 }
 
 #[test]
-fn duplicate_absent_id_across_owner_lanes_matches_sequential_failure() {
+fn duplicate_absent_id_across_owner_lanes_matches_sequential_failed_receipt() {
     let initial = StateTree::new(StateConfig::default()).unwrap();
     let id = Hash::digest(b"duplicate-fast-create");
     let first_owner = address(31);
@@ -292,29 +292,81 @@ fn duplicate_absent_id_across_owner_lanes_matches_sequential_failure() {
         .map(|transaction| transaction.operation.clone())
         .collect::<Vec<_>>();
     let mut sequential_state = initial.clone();
-    let sequential_error = SequentialExecutor::new(1_000)
+    let sequential_result = SequentialExecutor::new(1_000)
         .unwrap()
         .execute_block(&mut sequential_state, &operations)
-        .unwrap_err();
+        .unwrap();
     let mut parallel_state = initial;
-    let parallel_error = ParallelExecutor::new(1_000, 2)
+    let parallel_result = ParallelExecutor::new(1_000, 2)
         .unwrap()
         .execute_block(&mut parallel_state, &transactions)
-        .unwrap_err();
+        .unwrap();
 
     assert!(
-        sequential_error
-            .to_string()
-            .starts_with("transaction 1 failed")
+        matches!(
+            sequential_result.receipts[1].status,
+            ExecutionStatus::Failed(_)
+        ),
+        "the duplicate create must revert without invalidating the block"
     );
     assert!(
-        parallel_error
-            .to_string()
-            .starts_with("transaction 1 failed")
+        matches!(
+            parallel_result.receipts[1].status,
+            ExecutionStatus::Failed(_)
+        ),
+        "parallel execution must produce the same failed-transaction outcome"
     );
+    assert_eq!(parallel_result.state_root, sequential_result.state_root);
     assert_eq!(
         parallel_state.root().unwrap(),
         sequential_state.root().unwrap()
     );
     assert_eq!(parallel_state.object(&id), sequential_state.object(&id));
+}
+
+#[test]
+fn undeclared_write_reverts_without_blocking_a_later_transaction() {
+    let mut state = StateTree::new(StateConfig::default()).unwrap();
+    let owner = address(41);
+    let protected = object(41, Owner::Single(owner), 1);
+    let later = object(42, Owner::Single(owner), 2);
+    state.create_object(protected.clone()).unwrap();
+    let mut replacement = protected.clone();
+    replacement.data = vec![9];
+    let transactions = vec![
+        ExecutableTransaction {
+            operation: MoveOperation::MutateObject {
+                sender: owner,
+                id: protected.id,
+                expected_version: 0,
+                replacement,
+            },
+            object_references: Vec::new(),
+            compute_limit: 1_000,
+        },
+        transaction(
+            MoveOperation::CreateObject {
+                sender: owner,
+                object: later.clone(),
+            },
+            later.id,
+            Owner::Single(owner),
+        ),
+    ];
+    let result = ParallelExecutor::new(1_000, 2)
+        .unwrap()
+        .execute_block(&mut state, &transactions)
+        .unwrap();
+
+    assert!(matches!(
+        &result.receipts[0].status,
+        ExecutionStatus::Failed(ExecutionFailure::UndeclaredAccess { objects })
+            if objects.contains(&protected.id)
+    ));
+    assert_eq!(state.object(&protected.id), Some(&protected));
+    assert_eq!(state.object(&later.id), Some(&later));
+    assert!(matches!(
+        result.receipts[1].status,
+        ExecutionStatus::Succeeded
+    ));
 }
