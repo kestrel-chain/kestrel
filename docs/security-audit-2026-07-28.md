@@ -395,3 +395,21 @@ Real-TCP regressions cover both audited withholding boundaries:
 
 Both scenarios finalize in the original view. This status does not waive the
 recommended independent proof review or close any other finding.
+
+### KST-002
+
+**Implementation status:** Remediated on
+`codex/kst-002-failed-transaction-receipts`; independent review pending.
+
+Canonical transaction failures now produce deterministic failed receipts
+instead of invalidating finalized blocks. Each transaction executes against an
+isolated candidate state: success applies its delta, while failure commits no
+writes, charges the declared compute limit, consumes the already-admitted
+nonce, and allows later transactions to execute. Receipts are persisted in the
+same atomic batch as the block and checkpoint.
+
+Regression coverage includes nonexistent objects, duplicate/stale effects,
+undeclared writes, Move out-of-gas behavior, a successful transaction after a
+failure, pending-block replay after a crash, post-restart continuation, and a
+four-validator gossip/consensus/execution composition. This status does not
+close the separate fee-reservation failure in KST-005.

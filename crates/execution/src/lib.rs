@@ -8,7 +8,7 @@ use std::{
 
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use state::{ResurrectionWitness, StateAccesses, StateDelta, StateSnapshot, StateTree};
+use state::{ResurrectionWitness, StateAccesses, StateDelta, StateError, StateSnapshot, StateTree};
 use thiserror::Error;
 use types::{Address, Epoch, Hash, Object, ObjectId, Owner};
 use vm_move::{MoveCall, MoveHostError, MoveVmHost};
@@ -96,7 +96,7 @@ pub struct ExecutableTransaction {
 pub const NATIVE_OPERATION_COMPUTE_COST: u64 = 100;
 
 /// Scheduler path which produced a committed result.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ExecutionPath {
     Sequential,
     StructuralFastPath,
@@ -104,10 +104,25 @@ pub enum ExecutionPath {
     Reexecuted,
 }
 
+/// Deterministic transaction-level failure retained in an execution receipt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ExecutionFailure {
+    Operation(String),
+    UndeclaredAccess { objects: BTreeSet<ObjectId> },
+}
+
+/// Whether a finalized transaction committed effects or reverted them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ExecutionStatus {
+    Succeeded,
+    Failed(ExecutionFailure),
+}
+
 /// Block commitment and access metadata produced by one operation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionReceipt {
     pub transaction_index: usize,
+    pub status: ExecutionStatus,
     /// Final state root of the block containing this transaction.
     ///
     /// Kestrel computes the canonical commitment once after ordered commit;
@@ -301,19 +316,15 @@ impl Drop for DeferredExecutor {
     }
 }
 
-/// Execution failures include the canonical transaction index for diagnosis.
+/// Block-level execution failures. Transaction-level failures are represented
+/// by [`ExecutionStatus::Failed`] and do not invalidate finalized blocks.
 #[derive(Debug, Error)]
 pub enum ExecutionError {
-    #[error("transaction {index} failed: {source}")]
-    Transaction {
+    #[error("state-root calculation after transaction {index} failed: {source}")]
+    StateRoot {
         index: usize,
         #[source]
-        source: MoveHostError,
-    },
-    #[error("transaction {index} accessed undeclared objects: {objects:?}")]
-    UndeclaredAccess {
-        index: usize,
-        objects: BTreeSet<ObjectId>,
+        source: StateError,
     },
     #[error("parallel scheduler initialization failed: {0}")]
     SchedulerInitialization(String),
@@ -342,8 +353,9 @@ impl SequentialExecutor {
 
     /// Applies operations strictly in list order to a single state view.
     ///
-    /// Every individual operation is atomic. Successfully completed operations
-    /// before a later failure remain committed. This entry point takes bare
+    /// Every individual operation is atomic. A failed operation emits a
+    /// deterministic receipt, commits no state effects, and does not prevent
+    /// later operations from running. This entry point takes bare
     /// operations with no attached compute limit (used only as a sequential
     /// reference oracle by benches/equivalence tests, never by the live
     /// consensus-to-execution pipeline), so every operation is metered against
@@ -351,7 +363,7 @@ impl SequentialExecutor {
     ///
     /// # Errors
     ///
-    /// Returns the index and source error of the first rejected operation.
+    /// Returns only block-level state-root failures.
     pub fn execute_block(
         &self,
         state: &mut StateTree,
@@ -360,16 +372,29 @@ impl SequentialExecutor {
         let mut pending_receipts = Vec::with_capacity(operations.len());
         for (index, operation) in operations.iter().enumerate() {
             state.start_access_tracking();
+            // Every Move host and native object operation is itself atomic:
+            // it validates/prepares effects before applying them. Running the
+            // reference executor directly avoids an O(state size) clone per
+            // transaction while retaining rollback on its error path.
             let result = self.execute_operation(state, operation, LEGACY_OPERATION_COMPUTE_LIMIT);
             let accesses = state.finish_access_tracking();
-            let result = result.map_err(|source| ExecutionError::Transaction { index, source })?;
-            pending_receipts.push(pending_receipt(
-                index,
-                result,
-                accesses,
-                ExecutionPath::Sequential,
-                1,
-            ));
+            match result {
+                Ok(result) => pending_receipts.push(successful_pending_receipt(
+                    index,
+                    result,
+                    accesses,
+                    ExecutionPath::Sequential,
+                    1,
+                )),
+                Err(error) => pending_receipts.push(failed_pending_receipt(
+                    index,
+                    ExecutionFailure::Operation(error.to_string()),
+                    accesses,
+                    ExecutionPath::Sequential,
+                    1,
+                    LEGACY_OPERATION_COMPUTE_LIMIT,
+                )),
+            }
         }
 
         let state_root = block_root(state, operations.len())?;
@@ -553,7 +578,7 @@ impl ParallelExecutor {
             transactions.iter().zip(speculative.into_iter()).enumerate()
         {
             debug_assert_eq!(attempt.index, index);
-            ensure_declared(index, transaction, &attempt.accesses)?;
+            let speculative_undeclared = undeclared_accesses(transaction, &attempt.accesses);
             // Structural lanes are disjoint from every optimistic transaction
             // by construction, and transactions for one owner execute serially
             // inside their lane. They therefore need neither conflict-set scans
@@ -561,6 +586,7 @@ impl ParallelExecutor {
             let conflicts = !attempt.fast
                 && conflicts_with_committed_writes(&attempt.accesses, &committed_writes);
             if (attempt.fast || !conflicts)
+                && speculative_undeclared.is_empty()
                 && let Ok(success) = attempt.result
             {
                 if !attempt.fast {
@@ -576,6 +602,7 @@ impl ParallelExecutor {
                 };
                 pending_receipts.push(PendingReceipt {
                     transaction_index: index,
+                    status: ExecutionStatus::Succeeded,
                     event_count: success.event_count,
                     compute_used: success.compute_used,
                     read_set: attempt.accesses.reads,
@@ -588,23 +615,9 @@ impl ParallelExecutor {
 
             scheduler_stats.aborts += 1;
             scheduler_stats.reexecutions += 1;
-            state.start_access_tracking();
-            let result = reference.execute_operation(
-                state,
-                &transaction.operation,
-                transaction.compute_limit,
-            );
-            let accesses = state.finish_access_tracking();
-            ensure_declared(index, transaction, &accesses)?;
-            let result = result.map_err(|source| ExecutionError::Transaction { index, source })?;
-            committed_writes.extend(accesses.writes.iter().copied());
-            pending_receipts.push(pending_receipt(
-                index,
-                result,
-                accesses,
-                ExecutionPath::Reexecuted,
-                2,
-            ));
+            let receipt = reexecute_transaction(&reference, state, transaction, index);
+            committed_writes.extend(receipt.write_set.iter().copied());
+            pending_receipts.push(receipt);
         }
 
         let state_root = block_root(state, transactions.len())?;
@@ -677,6 +690,7 @@ struct OperationResult {
 
 struct PendingReceipt {
     transaction_index: usize,
+    status: ExecutionStatus,
     event_count: usize,
     compute_used: u64,
     read_set: BTreeSet<ObjectId>,
@@ -741,6 +755,51 @@ fn speculate(
         accesses,
         result,
         fast,
+    }
+}
+
+fn reexecute_transaction(
+    executor: &SequentialExecutor,
+    state: &mut StateTree,
+    transaction: &ExecutableTransaction,
+    index: usize,
+) -> PendingReceipt {
+    let mut candidate = state.clone();
+    candidate.start_access_tracking();
+    let result = executor.execute_operation(
+        &mut candidate,
+        &transaction.operation,
+        transaction.compute_limit,
+    );
+    let accesses = candidate.finish_access_tracking();
+    let undeclared = undeclared_accesses(transaction, &accesses);
+    if undeclared.is_empty() {
+        match result {
+            Ok(result) => {
+                let delta = candidate.delta_from(state);
+                state.apply_delta_owned(delta);
+                successful_pending_receipt(index, result, accesses, ExecutionPath::Reexecuted, 2)
+            }
+            Err(error) => failed_pending_receipt(
+                index,
+                ExecutionFailure::Operation(error.to_string()),
+                accesses,
+                ExecutionPath::Reexecuted,
+                2,
+                transaction.compute_limit,
+            ),
+        }
+    } else {
+        failed_pending_receipt(
+            index,
+            ExecutionFailure::UndeclaredAccess {
+                objects: undeclared,
+            },
+            accesses,
+            ExecutionPath::Reexecuted,
+            2,
+            transaction.compute_limit,
+        )
     }
 }
 
@@ -845,11 +904,10 @@ fn operation_changes_owner(operation: &MoveOperation, owner: Address) -> bool {
     }
 }
 
-fn ensure_declared(
-    index: usize,
+fn undeclared_accesses(
     transaction: &ExecutableTransaction,
     accesses: &StateAccesses,
-) -> Result<(), ExecutionError> {
+) -> BTreeSet<ObjectId> {
     let mut undeclared = BTreeSet::new();
     for id in &accesses.reads {
         if !transaction
@@ -869,14 +927,7 @@ fn ensure_declared(
             undeclared.insert(*id);
         }
     }
-    if undeclared.is_empty() {
-        Ok(())
-    } else {
-        Err(ExecutionError::UndeclaredAccess {
-            index,
-            objects: undeclared,
-        })
-    }
+    undeclared
 }
 
 const fn native_result() -> OperationResult {
@@ -886,7 +937,7 @@ const fn native_result() -> OperationResult {
     }
 }
 
-fn pending_receipt(
+fn successful_pending_receipt(
     transaction_index: usize,
     result: OperationResult,
     accesses: StateAccesses,
@@ -895,10 +946,31 @@ fn pending_receipt(
 ) -> PendingReceipt {
     PendingReceipt {
         transaction_index,
+        status: ExecutionStatus::Succeeded,
         event_count: result.event_count,
         compute_used: result.compute_used,
         read_set: accesses.reads,
         write_set: accesses.writes,
+        path,
+        attempts,
+    }
+}
+
+fn failed_pending_receipt(
+    transaction_index: usize,
+    failure: ExecutionFailure,
+    accesses: StateAccesses,
+    path: ExecutionPath,
+    attempts: usize,
+    compute_limit: u64,
+) -> PendingReceipt {
+    PendingReceipt {
+        transaction_index,
+        status: ExecutionStatus::Failed(failure),
+        event_count: 0,
+        compute_used: compute_limit,
+        read_set: accesses.reads,
+        write_set: BTreeSet::new(),
         path,
         attempts,
     }
@@ -912,6 +984,7 @@ fn finalize_receipts(
         .into_iter()
         .map(|pending| ExecutionReceipt {
             transaction_index: pending.transaction_index,
+            status: pending.status,
             state_root,
             event_count: pending.event_count,
             compute_used: pending.compute_used,
@@ -924,10 +997,9 @@ fn finalize_receipts(
 }
 
 fn block_root(state: &StateTree, index: usize) -> Result<Hash, ExecutionError> {
-    state.root().map_err(|source| ExecutionError::Transaction {
-        index,
-        source: MoveHostError::State(source),
-    })
+    state
+        .root()
+        .map_err(|source| ExecutionError::StateRoot { index, source })
 }
 
 #[cfg(test)]
@@ -939,10 +1011,13 @@ mod tests {
     use proptest::prelude::*;
     use state::{StateConfig, StateTree};
     use tempfile::TempDir;
-    use types::Address;
-    use vm_move::{MoveArgument, MoveCall, MoveModuleId};
+    use types::{Address, Hash, Object, Owner};
+    use vm_move::{MoveArgument, MoveCall, MoveModuleId, MoveVmHost};
 
-    use super::{MoveOperation, SequentialExecutor};
+    use super::{
+        AccessMode, DeclaredObjectRef, ExecutableTransaction, ExecutionFailure, ExecutionStatus,
+        MoveOperation, NATIVE_OPERATION_COMPUTE_COST, ParallelExecutor, SequentialExecutor,
+    };
 
     proptest! {
         #[test]
@@ -968,6 +1043,99 @@ mod tests {
             prop_assert_eq!(first.state_root, second.state_root);
             prop_assert_eq!(first_state.root().unwrap(), second_state.root().unwrap());
         }
+    }
+
+    #[test]
+    fn out_of_gas_move_transaction_reverts_and_later_transaction_executes() {
+        let sender = Address::from_bytes([0x66; 32]);
+        let module = compile_module(&token_source(sender));
+        let mut module_id_bytes = b"kestrel/move/module/v1".to_vec();
+        module_id_bytes.extend_from_slice(sender.as_bytes());
+        module_id_bytes.extend_from_slice(&5_u64.to_be_bytes());
+        module_id_bytes.extend_from_slice(b"Token");
+        let module_object_id = Hash::digest(module_id_bytes);
+        let object = Object {
+            id: Hash::digest(b"after-out-of-gas"),
+            owner: Owner::Single(sender),
+            type_tag: "test::AfterOutOfGas".to_owned(),
+            version: 0,
+            data: vec![7],
+            rent_balance: 100,
+        };
+        let mut state = StateTree::new(StateConfig::default()).unwrap();
+        MoveVmHost::new(100)
+            .unwrap()
+            .publish_module(&mut state, sender, module, 1_000_000)
+            .unwrap();
+        let call = MoveCall {
+            sender,
+            module: MoveModuleId {
+                address: sender,
+                name: "Token".to_owned(),
+            },
+            function: "mint".to_owned(),
+            arguments: vec![MoveArgument::Signer, MoveArgument::U64(10)],
+        };
+        let mut discovery = state.clone();
+        MoveVmHost::new(100)
+            .unwrap()
+            .execute_entry_function(&mut discovery, &call, 1_000_000)
+            .unwrap();
+        let resource_object_id = discovery
+            .active_objects()
+            .find(|candidate| candidate.id != module_object_id)
+            .unwrap()
+            .id;
+        let transactions = vec![
+            ExecutableTransaction {
+                operation: MoveOperation::EntryFunction(call),
+                object_references: vec![
+                    DeclaredObjectRef {
+                        id: module_object_id,
+                        owner: Owner::Shared,
+                        access: AccessMode::Read,
+                    },
+                    DeclaredObjectRef {
+                        id: resource_object_id,
+                        owner: Owner::Single(sender),
+                        access: AccessMode::Write,
+                    },
+                ],
+                compute_limit: 0,
+            },
+            ExecutableTransaction {
+                operation: MoveOperation::CreateObject {
+                    sender,
+                    object: object.clone(),
+                },
+                object_references: vec![DeclaredObjectRef {
+                    id: object.id,
+                    owner: object.owner.clone(),
+                    access: AccessMode::Write,
+                }],
+                compute_limit: NATIVE_OPERATION_COMPUTE_COST,
+            },
+        ];
+        let result = ParallelExecutor::new(100, 2)
+            .unwrap()
+            .execute_block(&mut state, &transactions)
+            .unwrap();
+
+        assert!(
+            matches!(
+                &result.receipts[0].status,
+                ExecutionStatus::Failed(ExecutionFailure::Operation(message))
+                    if message.contains("gas limit")
+            ),
+            "unexpected failure status: {:?}",
+            result.receipts[0].status
+        );
+        assert_eq!(result.receipts[0].compute_used, 0);
+        assert!(matches!(
+            result.receipts[1].status,
+            ExecutionStatus::Succeeded
+        ));
+        assert_eq!(state.object(&object.id), Some(&object));
     }
 
     fn operations(

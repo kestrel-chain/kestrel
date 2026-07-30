@@ -13,7 +13,7 @@ use crypto::{
 };
 use execution::{
     DeferredExecutionError, DeferredExecutionResult, DeferredExecutor, ExecutableTransaction,
-    ExecutionError, OrderedExecutionBlock,
+    ExecutionError, ExecutionReceipt, OrderedExecutionBlock,
 };
 use mempool::{FeeLedger, Settlement};
 use network::{KestrelCast, KestrelCastConfig, KestrelCastError, Shred};
@@ -30,6 +30,7 @@ use crate::{GenesisDocument, GenesisError};
 const CHECKPOINT_KEY: &[u8] = b"application/checkpoint/v1";
 const BLOCK_PREFIX: &[u8] = b"application/block/v1/";
 const PENDING_PREFIX: &[u8] = b"application/pending/v1/";
+const RECEIPT_PREFIX: &[u8] = b"application/receipt/v1/";
 const TRANSACTION_ID_DOMAIN: &[u8] = b"kestrel/transaction/id/v1";
 const CHECKPOINT_FORMAT_VERSION: u16 = 2;
 const SIGNED_EXECUTION_MAGIC: [u8; 8] = *b"KSTRTX01";
@@ -586,6 +587,12 @@ impl BlockLifecycle {
             .put(block_key(record.height), canonical_bytes(&record)?)
             .put(CHECKPOINT_KEY, canonical_bytes(&checkpoint)?)
             .delete(pending_key(record.height));
+        for receipt in &result.receipts {
+            batch.put(
+                receipt_key(record.height, receipt.transaction_index),
+                canonical_bytes(receipt)?,
+            );
+        }
         self.store.write_batch(batch)?;
 
         let restored = StateTree::from_durable_snapshot(snapshot.clone())?;
@@ -640,6 +647,24 @@ impl BlockLifecycle {
     pub fn block(&self, height: u64) -> Result<Option<DurableBlockRecord>, LifecycleError> {
         self.store
             .get(&block_key(height))?
+            .map(|bytes| {
+                bcs::from_bytes(&bytes).map_err(|error| LifecycleError::Encoding(error.to_string()))
+            })
+            .transpose()
+    }
+
+    /// Reads one atomically persisted transaction execution receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns storage or canonical decoding failures.
+    pub fn receipt(
+        &self,
+        height: u64,
+        transaction_index: usize,
+    ) -> Result<Option<ExecutionReceipt>, LifecycleError> {
+        self.store
+            .get(&receipt_key(height, transaction_index))?
             .map(|bytes| {
                 bcs::from_bytes(&bytes).map_err(|error| LifecycleError::Encoding(error.to_string()))
             })
@@ -738,6 +763,15 @@ fn pending_key(height: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(PENDING_PREFIX.len() + 8);
     key.extend_from_slice(PENDING_PREFIX);
     key.extend_from_slice(&height.to_be_bytes());
+    key
+}
+
+fn receipt_key(height: u64, transaction_index: usize) -> Vec<u8> {
+    let index = u64::try_from(transaction_index).unwrap_or(u64::MAX);
+    let mut key = Vec::with_capacity(RECEIPT_PREFIX.len() + 16);
+    key.extend_from_slice(RECEIPT_PREFIX);
+    key.extend_from_slice(&height.to_be_bytes());
+    key.extend_from_slice(&index.to_be_bytes());
     key
 }
 
