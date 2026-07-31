@@ -140,6 +140,7 @@ failure after an earlier successful transaction, including restart.
 
 **Severity:** High
 **Class:** Remote connection exhaustion / amplification
+**Status:** Remediated on `main` (2026-07-31)
 **Affected:** `crates/node/src/coordinator.rs:362-384`,
 `crates/node/src/coordinator.rs:665-820`,
 `crates/node/src/coordinator.rs:1260-1285`
@@ -161,6 +162,19 @@ Noise/TLS or reuse authenticated libp2p streams; bind transport identity to the
 genesis validator ID. Until then, enforce an IP/validator allowlist at the
 network edge. Add accept concurrency limits, header/body deadlines, idle
 timeouts, per-peer request budgets, and bounded catch-up response work.
+
+**Remediation:** Every TCP envelope now completes a fresh, genesis-bound mutual
+BLS challenge/response. The client verifies the receiving validator before
+sending its envelope; the server verifies that the claimed genesis validator
+signed the fresh challenge and exact envelope before dispatch. Consequently an
+outsider cannot forge `Envelope.sender` or trigger catch-up work. The listener
+uses a global semaphore, a bounded fixed-window source-IP admission budget, an
+authenticated per-validator semaphore, a bounded nonblocking dispatch queue,
+and explicit handshake/frame-header/frame-body deadlines. Catch-up requests
+have an additional per-validator work budget and responses retain their
+existing batch bound. Regressions cover silent clients, forged catch-up
+senders, global/per-validator concurrency exhaustion, budget reset, normal
+five-validator consensus, leader failure, and restart catch-up.
 
 ### KST-004 — Untrusted shreds can amplify traffic and consume gigabytes
 

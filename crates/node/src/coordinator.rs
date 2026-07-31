@@ -13,13 +13,13 @@ use consensus::{
 };
 use crypto::{AggregateSignatureScheme, Bls12381Scheme};
 use rpc::NodeStatus;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use storage::{KvStore, RocksDbStore, StorageError};
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::mpsc,
+    sync::{Semaphore, mpsc},
     time::{MissedTickBehavior, interval, sleep, timeout},
 };
 use tracing::{debug, warn};
@@ -88,6 +88,12 @@ fn round_timeout_for_view(base: Duration, view: u64) -> Duration {
 
 const SAFETY_STATE_KEY: &[u8] = b"consensus/replica-snapshot/v1";
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+const CONSENSUS_AUTH_VERSION: u16 = 1;
+const CONSENSUS_SERVER_AUTH_DOMAIN: &[u8] = b"kestrel/consensus/server-auth/v1";
+const CONSENSUS_CLIENT_AUTH_DOMAIN: &[u8] = b"kestrel/consensus/client-auth/v1";
+const MAXIMUM_HANDSHAKE_BYTES: usize = 4 * 1024;
+const AUTHENTICATED_FRAME_OVERHEAD: usize = 4 * 1024;
+const MAXIMUM_TRACKED_SOURCE_IPS: usize = 4_096;
 /// Gives transaction gossip one measured propagation window to reach the next
 /// leader before it snapshots an otherwise-empty mempool into a proposal.
 const EMPTY_MEMPOOL_PROPAGATION_MARGIN: Duration = Duration::from_millis(15);
@@ -100,6 +106,15 @@ pub struct CoordinatorConfig {
     pub proposal_rebroadcast: Duration,
     pub proposal_vote_delay: Duration,
     pub maximum_message_bytes: usize,
+    pub maximum_inbound_connections: usize,
+    pub maximum_peer_connections: usize,
+    pub maximum_connections_per_ip_per_window: u32,
+    pub connection_rate_window: Duration,
+    pub handshake_timeout: Duration,
+    pub frame_header_timeout: Duration,
+    pub frame_body_timeout: Duration,
+    pub maximum_catchup_requests_per_window: u32,
+    pub catchup_request_window: Duration,
     pub stop_after_height: Option<u64>,
 }
 
@@ -111,6 +126,15 @@ impl Default for CoordinatorConfig {
             proposal_rebroadcast: Duration::from_millis(50),
             proposal_vote_delay: Duration::from_millis(20),
             maximum_message_bytes: 4 * 1024 * 1024,
+            maximum_inbound_connections: 128,
+            maximum_peer_connections: 8,
+            maximum_connections_per_ip_per_window: 512,
+            connection_rate_window: Duration::from_secs(1),
+            handshake_timeout: Duration::from_millis(500),
+            frame_header_timeout: Duration::from_millis(250),
+            frame_body_timeout: Duration::from_secs(2),
+            maximum_catchup_requests_per_window: 8,
+            catchup_request_window: Duration::from_secs(1),
             stop_after_height: None,
         }
     }
@@ -150,6 +174,28 @@ pub struct CoordinatorOutcome {
 struct Envelope {
     sender: Hash,
     message: WireMessage,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ClientHello {
+    version: u16,
+    sender: Hash,
+    receiver: Hash,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ServerChallenge {
+    version: u16,
+    sender: Hash,
+    receiver: Hash,
+    nonce: [u8; 32],
+    signature: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AuthenticatedEnvelope {
+    envelope: Vec<u8>,
+    signature: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -209,6 +255,7 @@ impl ProposalTransactionSource for SyntheticProposalSource {
 /// Multi-process coordinator using authenticated protocol messages over real TCP sockets.
 pub struct ConsensusCoordinator {
     id: Hash,
+    chain_identity: Hash,
     private_key: Vec<u8>,
     validators: ValidatorSet,
     scheme: Arc<dyn AggregateSignatureScheme>,
@@ -224,6 +271,44 @@ pub struct ConsensusCoordinator {
     /// When this validator last asked a peer to replay missing orders, used to
     /// throttle catch-up requests.
     last_catchup_request: Option<Instant>,
+    catchup_request_budgets: BTreeMap<Hash, RequestBudget>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RequestBudget {
+    window_started: Instant,
+    requests: u32,
+}
+
+fn within_request_budget<K: Ord>(
+    budgets: &mut BTreeMap<K, RequestBudget>,
+    key: K,
+    maximum_requests: u32,
+    window: Duration,
+    now: Instant,
+) -> bool {
+    let budget = budgets.entry(key).or_insert(RequestBudget {
+        window_started: now,
+        requests: 0,
+    });
+    if now.duration_since(budget.window_started) >= window {
+        budget.window_started = now;
+        budget.requests = 0;
+    }
+    if budget.requests >= maximum_requests {
+        return false;
+    }
+    budget.requests += 1;
+    true
+}
+
+#[derive(Clone)]
+struct TransportAuthenticator {
+    local_id: Hash,
+    chain_identity: Hash,
+    private_key: Vec<u8>,
+    validators: ValidatorSet,
+    scheme: Arc<dyn AggregateSignatureScheme>,
 }
 
 impl ConsensusCoordinator {
@@ -305,11 +390,22 @@ impl ConsensusCoordinator {
             || config.proposal_vote_delay.is_zero()
             || config.proposal_vote_delay >= config.fast_path_wait
             || config.maximum_message_bytes == 0
+            || config.maximum_inbound_connections == 0
+            || config.maximum_peer_connections == 0
+            || config.maximum_peer_connections > config.maximum_inbound_connections
+            || config.maximum_connections_per_ip_per_window == 0
+            || config.connection_rate_window.is_zero()
+            || config.handshake_timeout.is_zero()
+            || config.frame_header_timeout.is_zero()
+            || config.frame_body_timeout.is_zero()
+            || config.maximum_catchup_requests_per_window == 0
+            || config.catchup_request_window.is_zero()
             || faults.drop_basis_points > 10_000
         {
             return Err(CoordinatorError::InvalidConfiguration);
         }
         let validated = genesis.validate()?;
+        let chain_identity = validated.genesis_hash;
         let scheme: Arc<dyn AggregateSignatureScheme> = Arc::new(Bls12381Scheme);
         let validator = validated
             .validators
@@ -357,6 +453,7 @@ impl ConsensusCoordinator {
         };
         Ok(Self {
             id,
+            chain_identity,
             private_key,
             validators: validated.validators,
             scheme,
@@ -370,6 +467,7 @@ impl ConsensusCoordinator {
             proposal_source,
             finalized_order_sender,
             last_catchup_request: None,
+            catchup_request_budgets: BTreeMap::new(),
         })
     }
 
@@ -387,20 +485,23 @@ impl ConsensusCoordinator {
             .listener
             .take()
             .ok_or(CoordinatorError::ListenerAlreadyTaken)?;
-        let maximum_message_bytes = self.config.maximum_message_bytes;
-        let listener_task = AbortTask(tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    break;
-                };
-                let sender = incoming_sender.clone();
-                tokio::spawn(async move {
-                    if let Ok(envelope) = read_envelope(stream, maximum_message_bytes).await {
-                        let _ = sender.send(envelope).await;
-                    }
-                });
-            }
-        }));
+        let listener_task = spawn_authenticated_listener(
+            listener,
+            incoming_sender,
+            TransportAuthenticator {
+                local_id: self.id,
+                chain_identity: self.chain_identity,
+                private_key: self.private_key.clone(),
+                validators: self.validators.clone(),
+                scheme: Arc::clone(&self.scheme),
+            },
+            self.peers
+                .keys()
+                .copied()
+                .filter(|peer| *peer != self.id)
+                .collect(),
+            self.config,
+        );
         wait_for_genesis(genesis_unix_ms).await;
 
         let mut round = RoundState::new();
@@ -849,6 +950,13 @@ impl ConsensusCoordinator {
                 }
             }
             WireMessage::RequestOrders { from_height } => {
+                if !self.allow_catchup_request(envelope.sender) {
+                    debug!(
+                        peer = %envelope.sender,
+                        "dropping catch-up request above the authenticated peer budget"
+                    );
+                    return Ok(None);
+                }
                 let orders = self.load_finalized_orders(
                     from_height,
                     from_height.saturating_add(MAXIMUM_CATCHUP_BATCH as u64),
@@ -863,6 +971,16 @@ impl ConsensusCoordinator {
             }
         }
         Ok(None)
+    }
+
+    fn allow_catchup_request(&mut self, peer: Hash) -> bool {
+        within_request_budget(
+            &mut self.catchup_request_budgets,
+            peer,
+            self.config.maximum_catchup_requests_per_window,
+            self.config.catchup_request_window,
+            Instant::now(),
+        )
     }
 
     /// Asks `peer` to replay the finalized orders this validator is missing,
@@ -1110,7 +1228,18 @@ impl ConsensusCoordinator {
             sender: self.id,
             message,
         };
-        let _ = send_envelope(address, &envelope).await;
+        let _ = send_authenticated_envelope(
+            address,
+            peer,
+            &envelope,
+            self.id,
+            self.chain_identity,
+            &self.private_key,
+            &self.validators,
+            self.scheme.as_ref(),
+            &self.config,
+        )
+        .await;
     }
 
     fn should_drop(&self, peer: Hash, message: &WireMessage) -> bool {
@@ -1235,6 +1364,83 @@ impl Drop for AbortTask {
     }
 }
 
+fn spawn_authenticated_listener(
+    listener: TcpListener,
+    incoming_sender: mpsc::Sender<Envelope>,
+    authenticator: TransportAuthenticator,
+    peers: Vec<Hash>,
+    config: CoordinatorConfig,
+) -> AbortTask {
+    let authenticator = Arc::new(authenticator);
+    let global_connections = Arc::new(Semaphore::new(config.maximum_inbound_connections));
+    let peer_connections = Arc::new(
+        peers
+            .into_iter()
+            .map(|peer| {
+                (
+                    peer,
+                    Arc::new(Semaphore::new(config.maximum_peer_connections)),
+                )
+            })
+            .collect::<BTreeMap<_, _>>(),
+    );
+    AbortTask(tokio::spawn(async move {
+        let mut source_ip_budgets = BTreeMap::new();
+        loop {
+            let Ok((stream, source)) = listener.accept().await else {
+                break;
+            };
+            let now = Instant::now();
+            source_ip_budgets.retain(|_, budget: &mut RequestBudget| {
+                now.duration_since(budget.window_started) < config.connection_rate_window
+            });
+            let source_ip = source.ip();
+            if !source_ip_budgets.contains_key(&source_ip)
+                && source_ip_budgets.len() >= MAXIMUM_TRACKED_SOURCE_IPS
+            {
+                debug!(
+                    %source_ip,
+                    "dropping consensus connection above the source-IP tracking limit"
+                );
+                continue;
+            }
+            if !within_request_budget(
+                &mut source_ip_budgets,
+                source_ip,
+                config.maximum_connections_per_ip_per_window,
+                config.connection_rate_window,
+                now,
+            ) {
+                debug!(
+                    %source_ip,
+                    "dropping consensus connection above the source-IP rate limit"
+                );
+                continue;
+            }
+            let Ok(connection_permit) = Arc::clone(&global_connections).try_acquire_owned() else {
+                debug!("dropping consensus connection above the global concurrency limit");
+                continue;
+            };
+            let sender = incoming_sender.clone();
+            let authenticator = Arc::clone(&authenticator);
+            let peer_connections = Arc::clone(&peer_connections);
+            tokio::spawn(async move {
+                let _connection_permit = connection_permit;
+                if let Ok(envelope) = read_authenticated_envelope(
+                    stream,
+                    authenticator.as_ref(),
+                    peer_connections.as_ref(),
+                    &config,
+                )
+                .await
+                {
+                    let _ = sender.try_send(envelope);
+                }
+            });
+        }
+    }))
+}
+
 impl RoundState {
     fn new() -> Self {
         let now = Instant::now();
@@ -1349,31 +1555,273 @@ async fn wait_for_genesis(genesis_unix_ms: u64) {
     }
 }
 
-async fn send_envelope(address: SocketAddr, envelope: &Envelope) -> Result<(), CoordinatorError> {
-    let bytes =
+#[allow(clippy::too_many_arguments)]
+async fn send_authenticated_envelope(
+    address: SocketAddr,
+    receiver: Hash,
+    envelope: &Envelope,
+    local_id: Hash,
+    chain_identity: Hash,
+    private_key: &[u8],
+    validators: &ValidatorSet,
+    scheme: &dyn AggregateSignatureScheme,
+    config: &CoordinatorConfig,
+) -> Result<(), CoordinatorError> {
+    let envelope_bytes =
         bcs::to_bytes(envelope).map_err(|error| CoordinatorError::Encoding(error.to_string()))?;
-    let length = u32::try_from(bytes.len()).map_err(|_| CoordinatorError::MessageTooLarge)?;
+    if envelope_bytes.is_empty() || envelope_bytes.len() > config.maximum_message_bytes {
+        return Err(CoordinatorError::MessageTooLarge);
+    }
     let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(address))
         .await
         .map_err(|_| CoordinatorError::ConnectTimeout)??;
-    stream.write_all(&length.to_be_bytes()).await?;
-    stream.write_all(&bytes).await?;
-    stream.shutdown().await?;
+    let hello = ClientHello {
+        version: CONSENSUS_AUTH_VERSION,
+        sender: local_id,
+        receiver,
+    };
+    let challenge: ServerChallenge = timeout(config.handshake_timeout, async {
+        write_serialized_frame(
+            &mut stream,
+            &hello,
+            MAXIMUM_HANDSHAKE_BYTES,
+            config.handshake_timeout,
+        )
+        .await?;
+        read_serialized_frame(
+            &mut stream,
+            MAXIMUM_HANDSHAKE_BYTES,
+            config.handshake_timeout,
+            config.handshake_timeout,
+        )
+        .await
+    })
+    .await
+    .map_err(|_| CoordinatorError::HandshakeTimeout)??;
+    if challenge.version != CONSENSUS_AUTH_VERSION
+        || challenge.sender != receiver
+        || challenge.receiver != local_id
+    {
+        return Err(CoordinatorError::AuthenticationMismatch);
+    }
+    let validator = validators
+        .validator(receiver)
+        .ok_or(CoordinatorError::UnknownTransportPeer)?;
+    scheme.verify(
+        &validator.public_key,
+        &server_authentication_message(
+            chain_identity,
+            challenge.sender,
+            challenge.receiver,
+            challenge.nonce,
+        ),
+        &challenge.signature,
+    )?;
+    let signature = scheme.sign(
+        private_key,
+        &client_authentication_message(
+            chain_identity,
+            local_id,
+            receiver,
+            challenge.nonce,
+            &envelope_bytes,
+        ),
+    )?;
+    write_serialized_frame(
+        &mut stream,
+        &AuthenticatedEnvelope {
+            envelope: envelope_bytes,
+            signature,
+        },
+        config
+            .maximum_message_bytes
+            .saturating_add(AUTHENTICATED_FRAME_OVERHEAD),
+        config.frame_body_timeout,
+    )
+    .await?;
+    timeout(config.frame_body_timeout, stream.shutdown())
+        .await
+        .map_err(|_| CoordinatorError::FrameBodyTimeout)??;
     Ok(())
 }
 
-async fn read_envelope(
+async fn read_authenticated_envelope(
     mut stream: TcpStream,
-    maximum_message_bytes: usize,
+    authenticator: &TransportAuthenticator,
+    peer_connections: &BTreeMap<Hash, Arc<Semaphore>>,
+    config: &CoordinatorConfig,
 ) -> Result<Envelope, CoordinatorError> {
+    let (hello, challenge) = timeout(config.handshake_timeout, async {
+        let hello: ClientHello = read_serialized_frame(
+            &mut stream,
+            MAXIMUM_HANDSHAKE_BYTES,
+            config.handshake_timeout,
+            config.handshake_timeout,
+        )
+        .await?;
+        if hello.version != CONSENSUS_AUTH_VERSION
+            || hello.receiver != authenticator.local_id
+            || hello.sender == authenticator.local_id
+            || authenticator.validators.validator(hello.sender).is_none()
+        {
+            return Err(CoordinatorError::AuthenticationMismatch);
+        }
+        let nonce: [u8; 32] = Bls12381Scheme::generate_os_private_key()
+            .try_into()
+            .map_err(|_| CoordinatorError::AuthenticationMismatch)?;
+        let signature = authenticator.scheme.sign(
+            &authenticator.private_key,
+            &server_authentication_message(
+                authenticator.chain_identity,
+                authenticator.local_id,
+                hello.sender,
+                nonce,
+            ),
+        )?;
+        let challenge = ServerChallenge {
+            version: CONSENSUS_AUTH_VERSION,
+            sender: authenticator.local_id,
+            receiver: hello.sender,
+            nonce,
+            signature,
+        };
+        write_serialized_frame(
+            &mut stream,
+            &challenge,
+            MAXIMUM_HANDSHAKE_BYTES,
+            config.handshake_timeout,
+        )
+        .await?;
+        Ok::<_, CoordinatorError>((hello, challenge))
+    })
+    .await
+    .map_err(|_| CoordinatorError::HandshakeTimeout)??;
+    let authenticated: AuthenticatedEnvelope = read_serialized_frame(
+        &mut stream,
+        config
+            .maximum_message_bytes
+            .saturating_add(AUTHENTICATED_FRAME_OVERHEAD),
+        config.frame_header_timeout,
+        config.frame_body_timeout,
+    )
+    .await?;
+    if authenticated.envelope.is_empty()
+        || authenticated.envelope.len() > config.maximum_message_bytes
+    {
+        return Err(CoordinatorError::MessageTooLarge);
+    }
+    let validator = authenticator
+        .validators
+        .validator(hello.sender)
+        .ok_or(CoordinatorError::UnknownTransportPeer)?;
+    authenticator.scheme.verify(
+        &validator.public_key,
+        &client_authentication_message(
+            authenticator.chain_identity,
+            hello.sender,
+            authenticator.local_id,
+            challenge.nonce,
+            &authenticated.envelope,
+        ),
+        &authenticated.signature,
+    )?;
+    let _peer_permit = acquire_authenticated_peer_connection(peer_connections, hello.sender)?;
+    let envelope: Envelope = bcs::from_bytes(&authenticated.envelope)
+        .map_err(|error| CoordinatorError::Encoding(error.to_string()))?;
+    if envelope.sender != hello.sender {
+        return Err(CoordinatorError::AuthenticationMismatch);
+    }
+    Ok(envelope)
+}
+
+fn acquire_authenticated_peer_connection(
+    peer_connections: &BTreeMap<Hash, Arc<Semaphore>>,
+    peer: Hash,
+) -> Result<tokio::sync::OwnedSemaphorePermit, CoordinatorError> {
+    let peer_limit = peer_connections
+        .get(&peer)
+        .ok_or(CoordinatorError::UnknownTransportPeer)?;
+    Arc::clone(peer_limit)
+        .try_acquire_owned()
+        .map_err(|_| CoordinatorError::PeerConnectionLimitReached)
+}
+
+fn server_authentication_message(
+    chain_identity: Hash,
+    sender: Hash,
+    receiver: Hash,
+    nonce: [u8; 32],
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(
+        CONSENSUS_SERVER_AUTH_DOMAIN.len() + chain_identity.as_bytes().len() * 4,
+    );
+    message.extend_from_slice(CONSENSUS_SERVER_AUTH_DOMAIN);
+    message.extend_from_slice(chain_identity.as_bytes());
+    message.extend_from_slice(sender.as_bytes());
+    message.extend_from_slice(receiver.as_bytes());
+    message.extend_from_slice(&nonce);
+    message
+}
+
+fn client_authentication_message(
+    chain_identity: Hash,
+    sender: Hash,
+    receiver: Hash,
+    nonce: [u8; 32],
+    envelope: &[u8],
+) -> Vec<u8> {
+    let envelope_digest = Hash::digest(envelope);
+    let mut message = Vec::with_capacity(
+        CONSENSUS_CLIENT_AUTH_DOMAIN.len() + chain_identity.as_bytes().len() * 5,
+    );
+    message.extend_from_slice(CONSENSUS_CLIENT_AUTH_DOMAIN);
+    message.extend_from_slice(chain_identity.as_bytes());
+    message.extend_from_slice(sender.as_bytes());
+    message.extend_from_slice(receiver.as_bytes());
+    message.extend_from_slice(&nonce);
+    message.extend_from_slice(envelope_digest.as_bytes());
+    message
+}
+
+async fn write_serialized_frame<T: Serialize>(
+    stream: &mut TcpStream,
+    value: &T,
+    maximum_bytes: usize,
+    deadline: Duration,
+) -> Result<(), CoordinatorError> {
+    let bytes =
+        bcs::to_bytes(value).map_err(|error| CoordinatorError::Encoding(error.to_string()))?;
+    if bytes.is_empty() || bytes.len() > maximum_bytes {
+        return Err(CoordinatorError::MessageTooLarge);
+    }
+    let length = u32::try_from(bytes.len()).map_err(|_| CoordinatorError::MessageTooLarge)?;
+    timeout(deadline, async {
+        stream.write_all(&length.to_be_bytes()).await?;
+        stream.write_all(&bytes).await
+    })
+    .await
+    .map_err(|_| CoordinatorError::FrameBodyTimeout)??;
+    Ok(())
+}
+
+async fn read_serialized_frame<T: DeserializeOwned>(
+    stream: &mut TcpStream,
+    maximum_bytes: usize,
+    header_deadline: Duration,
+    body_deadline: Duration,
+) -> Result<T, CoordinatorError> {
     let mut length = [0_u8; 4];
-    stream.read_exact(&mut length).await?;
+    timeout(header_deadline, stream.read_exact(&mut length))
+        .await
+        .map_err(|_| CoordinatorError::FrameHeaderTimeout)??;
     let length = usize::try_from(u32::from_be_bytes(length)).unwrap_or(usize::MAX);
-    if length == 0 || length > maximum_message_bytes {
+    if length == 0 || length > maximum_bytes {
         return Err(CoordinatorError::MessageTooLarge);
     }
     let mut bytes = vec![0_u8; length];
-    stream.read_exact(&mut bytes).await?;
+    timeout(body_deadline, stream.read_exact(&mut bytes))
+        .await
+        .map_err(|_| CoordinatorError::FrameBodyTimeout)??;
     bcs::from_bytes(&bytes).map_err(|error| CoordinatorError::Encoding(error.to_string()))
 }
 
@@ -1397,6 +1845,18 @@ pub enum CoordinatorError {
     FinalizedOrderSinkClosed,
     #[error("consensus peer connection timed out")]
     ConnectTimeout,
+    #[error("consensus validator handshake timed out")]
+    HandshakeTimeout,
+    #[error("consensus frame header timed out")]
+    FrameHeaderTimeout,
+    #[error("consensus frame body timed out")]
+    FrameBodyTimeout,
+    #[error("consensus transport peer is not a configured genesis validator")]
+    UnknownTransportPeer,
+    #[error("consensus transport authentication did not match genesis identities")]
+    AuthenticationMismatch,
+    #[error("consensus peer exceeded its concurrent connection limit")]
+    PeerConnectionLimitReached,
     #[error("consensus listener was already consumed")]
     ListenerAlreadyTaken,
     #[error("consensus encoding failed: {0}")]
@@ -1426,12 +1886,18 @@ mod tests {
     use crypto::{Bls12381Scheme, SignatureScheme};
     use rpc::NodeStatus;
     use tempfile::TempDir;
+    use tokio::net::{TcpListener, TcpStream};
     use types::Hash;
 
     use crate::{GENESIS_FORMAT_VERSION, GenesisDocument, GenesisValidator};
 
     use super::{
-        ConsensusCoordinator, CoordinatorConfig, CoordinatorFaults, ProposalTransactionSource,
+        AuthenticatedEnvelope, ClientHello, ConsensusCoordinator, CoordinatorConfig,
+        CoordinatorError, CoordinatorFaults, Envelope, MAXIMUM_HANDSHAKE_BYTES,
+        ProposalTransactionSource, ServerChallenge, TransportAuthenticator, WireMessage,
+        acquire_authenticated_peer_connection, client_authentication_message,
+        read_authenticated_envelope, read_serialized_frame, within_request_budget,
+        write_serialized_frame,
     };
 
     /// Serialises the real-TCP consensus tests against each other. Each starts
@@ -1460,6 +1926,187 @@ mod tests {
             bytes.extend_from_slice(parent_id.as_bytes());
             Some((vec![Hash::digest(bytes)], Hash::default()))
         }
+    }
+
+    async fn tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (client, accepted) = tokio::join!(TcpStream::connect(address), listener.accept());
+        (client.unwrap(), accepted.unwrap().0)
+    }
+
+    fn transport_authenticator(
+        genesis: &GenesisDocument,
+        keys: &[Vec<u8>],
+        index: usize,
+    ) -> TransportAuthenticator {
+        let validated = genesis.validate().unwrap();
+        TransportAuthenticator {
+            local_id: genesis.validators[index].validator.id,
+            chain_identity: validated.genesis_hash,
+            private_key: keys[index].clone(),
+            validators: validated.validators,
+            scheme: Arc::new(Bls12381Scheme),
+        }
+    }
+
+    fn peer_connection_limits(
+        genesis: &GenesisDocument,
+        local_index: usize,
+        limit: usize,
+    ) -> BTreeMap<Hash, Arc<tokio::sync::Semaphore>> {
+        let local_id = genesis.validators[local_index].validator.id;
+        genesis
+            .validators
+            .iter()
+            .map(|entry| entry.validator.id)
+            .filter(|peer| *peer != local_id)
+            .map(|peer| (peer, Arc::new(tokio::sync::Semaphore::new(limit))))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_slow_client_cannot_hold_a_consensus_reader_indefinitely() {
+        let (genesis, keys, reservations) = fixture_genesis(4);
+        drop(reservations);
+        let authenticator = transport_authenticator(&genesis, &keys, 0);
+        let peer_limits = peer_connection_limits(&genesis, 0, 1);
+        let config = CoordinatorConfig {
+            handshake_timeout: Duration::from_millis(25),
+            frame_header_timeout: Duration::from_millis(25),
+            frame_body_timeout: Duration::from_millis(25),
+            ..CoordinatorConfig::default()
+        };
+        let (_idle_client, server) = tcp_pair().await;
+
+        let result =
+            read_authenticated_envelope(server, &authenticator, &peer_limits, &config).await;
+        assert!(matches!(
+            result,
+            Err(CoordinatorError::HandshakeTimeout | CoordinatorError::FrameHeaderTimeout)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_forged_validator_cannot_trigger_a_catchup_request() {
+        let (genesis, keys, reservations) = fixture_genesis(4);
+        drop(reservations);
+        let authenticator = Arc::new(transport_authenticator(&genesis, &keys, 0));
+        let peer_limits = Arc::new(peer_connection_limits(&genesis, 0, 1));
+        let config = CoordinatorConfig::default();
+        let (mut client, server) = tcp_pair().await;
+        let server_authenticator = Arc::clone(&authenticator);
+        let server_peer_limits = Arc::clone(&peer_limits);
+        let server_task = tokio::spawn(async move {
+            read_authenticated_envelope(
+                server,
+                server_authenticator.as_ref(),
+                server_peer_limits.as_ref(),
+                &config,
+            )
+            .await
+        });
+
+        let claimed_sender = genesis.validators[1].validator.id;
+        write_serialized_frame(
+            &mut client,
+            &ClientHello {
+                version: super::CONSENSUS_AUTH_VERSION,
+                sender: claimed_sender,
+                receiver: authenticator.local_id,
+            },
+            MAXIMUM_HANDSHAKE_BYTES,
+            config.handshake_timeout,
+        )
+        .await
+        .unwrap();
+        let challenge: ServerChallenge = read_serialized_frame(
+            &mut client,
+            MAXIMUM_HANDSHAKE_BYTES,
+            config.handshake_timeout,
+            config.handshake_timeout,
+        )
+        .await
+        .unwrap();
+        let envelope = bcs::to_bytes(&Envelope {
+            sender: claimed_sender,
+            message: WireMessage::RequestOrders { from_height: 1 },
+        })
+        .unwrap();
+        let forged_signature = Bls12381Scheme
+            .sign(
+                &[99; 32],
+                &client_authentication_message(
+                    authenticator.chain_identity,
+                    claimed_sender,
+                    authenticator.local_id,
+                    challenge.nonce,
+                    &envelope,
+                ),
+            )
+            .unwrap();
+        write_serialized_frame(
+            &mut client,
+            &AuthenticatedEnvelope {
+                envelope,
+                signature: forged_signature,
+            },
+            config.maximum_message_bytes + super::AUTHENTICATED_FRAME_OVERHEAD,
+            config.frame_body_timeout,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            server_task.await.unwrap(),
+            Err(CoordinatorError::Crypto(
+                crypto::CryptoError::VerificationFailed
+            ))
+        ));
+    }
+
+    #[test]
+    fn one_validator_cannot_exceed_its_connection_concurrency_budget() {
+        let (genesis, _keys, reservations) = fixture_genesis(4);
+        drop(reservations);
+        let global = Arc::new(tokio::sync::Semaphore::new(1));
+        let global_permit = Arc::clone(&global).try_acquire_owned().unwrap();
+        assert!(
+            Arc::clone(&global).try_acquire_owned().is_err(),
+            "the listener must reject work above its global connection bound"
+        );
+        drop(global_permit);
+
+        let peer_limits = peer_connection_limits(&genesis, 0, 1);
+        let claimed_sender = genesis.validators[1].validator.id;
+        let first = acquire_authenticated_peer_connection(&peer_limits, claimed_sender).unwrap();
+        assert!(matches!(
+            acquire_authenticated_peer_connection(&peer_limits, claimed_sender),
+            Err(CoordinatorError::PeerConnectionLimitReached)
+        ));
+        drop(first);
+        assert!(
+            acquire_authenticated_peer_connection(&peer_limits, claimed_sender).is_ok(),
+            "releasing one authenticated connection must restore peer capacity"
+        );
+    }
+
+    #[test]
+    fn connection_and_catchup_windows_reject_excess_work_and_reset() {
+        let peer = Hash::digest(b"budgeted-validator");
+        let now = Instant::now();
+        let window = Duration::from_secs(1);
+        let mut budgets = BTreeMap::new();
+        assert!(within_request_budget(&mut budgets, peer, 2, window, now));
+        assert!(within_request_budget(&mut budgets, peer, 2, window, now));
+        assert!(!within_request_budget(&mut budgets, peer, 2, window, now));
+        assert!(within_request_budget(
+            &mut budgets,
+            peer,
+            2,
+            window,
+            now + window
+        ));
     }
 
     #[test]

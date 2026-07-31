@@ -4,7 +4,10 @@ Phase 6 validator process boundary and deterministic genesis validation. `node r
 
 Supplying `--validator-id`, `--validator-key`, `--gossip-key`, and `--data-dir`
 together enables the full validator pipeline. The raw-TCP coordinator relays
-authenticated proposals, exchanges BLS votes and certificates, and persists
+proposals, votes, certificates, and bounded catch-up traffic only after a
+genesis-bound mutual BLS challenge/response authenticates both validators.
+Global, source-IP, and authenticated-peer connection limits plus handshake and
+frame deadlines bound slow or flooding clients. The coordinator persists
 replica vote/lock safety state. A separate libp2p service carries signed
 transaction gossip and `KestrelCast` shreds. Certified payloads run through
 deferred execution and are atomically committed with application state and
