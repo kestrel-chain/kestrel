@@ -299,13 +299,21 @@ impl LocalizedMempool {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FeeLedger {
     balances: BTreeMap<Address, u128>,
+    reservations: BTreeMap<Hash, FeeReservation>,
+    reserved_by_payer: BTreeMap<Address, u128>,
+    reserved_validator_credits: BTreeMap<Address, u128>,
 }
 
 impl FeeLedger {
     /// Restores a ledger from durably persisted or genesis-seeded balances.
     #[must_use]
     pub const fn from_balances(balances: BTreeMap<Address, u128>) -> Self {
-        Self { balances }
+        Self {
+            balances,
+            reservations: BTreeMap::new(),
+            reserved_by_payer: BTreeMap::new(),
+            reserved_validator_credits: BTreeMap::new(),
+        }
     }
 
     /// Returns the full balance table for durable persistence.
@@ -333,11 +341,171 @@ impl FeeLedger {
         self.balances.get(&address).copied().unwrap_or_default()
     }
 
-    /// Charges actual—not reserved—compute and transfers the full fee to the validator.
+    /// Returns funds not locked by admitted transactions.
+    #[must_use]
+    pub fn available_balance(&self, address: Address) -> u128 {
+        self.balance(address).saturating_sub(
+            self.reserved_by_payer
+                .get(&address)
+                .copied()
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Locks the maximum amount the signed envelope permits the transaction to
+    /// pay. Repeating the identical reservation is idempotent so gossip,
+    /// reconstructed payloads, and restart replay can converge safely.
     ///
     /// # Errors
     ///
-    /// Rejects excess compute, arithmetic overflow, or insufficient payer balance.
+    /// Rejects arithmetic overflow, conflicting reuse of a transaction ID, or
+    /// a payer whose unreserved balance cannot cover the maximum charge.
+    pub fn reserve_maximum(
+        &mut self,
+        transaction_id: Hash,
+        payer: Address,
+        compute_limit: u64,
+        max_fee_per_compute: u128,
+    ) -> Result<(), MempoolError> {
+        let amount = max_fee_per_compute
+            .checked_mul(u128::from(compute_limit))
+            .ok_or(MempoolError::FeeOverflow)?;
+        let reservation = FeeReservation {
+            transaction_id,
+            payer,
+            compute_limit,
+            max_fee_per_compute,
+            amount,
+            settlement: None,
+        };
+        if let Some(existing) = self.reservations.get(&transaction_id) {
+            return if existing.payer == payer
+                && existing.compute_limit == compute_limit
+                && existing.max_fee_per_compute == max_fee_per_compute
+            {
+                Ok(())
+            } else {
+                Err(MempoolError::ReservationMismatch)
+            };
+        }
+        let already_reserved = self
+            .reserved_by_payer
+            .get(&payer)
+            .copied()
+            .unwrap_or_default();
+        let total_reserved = already_reserved
+            .checked_add(amount)
+            .ok_or(MempoolError::FeeOverflow)?;
+        if total_reserved > self.balance(payer) {
+            return Err(MempoolError::InsufficientBalance);
+        }
+        self.reserved_by_payer.insert(payer, total_reserved);
+        self.reservations.insert(transaction_id, reservation);
+        Ok(())
+    }
+
+    /// Binds an existing maximum reservation to the certified unit price and
+    /// block leader. Reserving the leader's worst-case credit here guarantees
+    /// that settlement cannot overflow after execution.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing/mismatched reservations, a certified price above the
+    /// signed cap, or insufficient credit capacity at the validator.
+    pub fn bind_settlement(
+        &mut self,
+        settlement: Settlement,
+        validator: Address,
+    ) -> Result<(), MempoolError> {
+        let unit_price = settlement
+            .local_base_fee_per_compute
+            .checked_add(settlement.priority_fee_per_compute)
+            .ok_or(MempoolError::FeeOverflow)?;
+        let maximum_charge = unit_price
+            .checked_mul(u128::from(settlement.compute_limit))
+            .ok_or(MempoolError::FeeOverflow)?;
+        let reservation = self
+            .reservations
+            .get(&settlement.transaction_id)
+            .ok_or(MempoolError::MissingReservation)?;
+        if reservation.payer != settlement.payer
+            || reservation.compute_limit != settlement.compute_limit
+            || unit_price > reservation.max_fee_per_compute
+            || maximum_charge > reservation.amount
+        {
+            return Err(MempoolError::ReservationMismatch);
+        }
+        let binding = SettlementBinding {
+            settlement,
+            validator,
+            maximum_charge,
+        };
+        if let Some(existing) = reservation.settlement {
+            return if existing == binding {
+                Ok(())
+            } else {
+                Err(MempoolError::ReservationMismatch)
+            };
+        }
+        if settlement.payer != validator {
+            let reserved_credit = self
+                .reserved_validator_credits
+                .get(&validator)
+                .copied()
+                .unwrap_or_default();
+            let total_credit = reserved_credit
+                .checked_add(maximum_charge)
+                .ok_or(MempoolError::FeeOverflow)?;
+            self.balance(validator)
+                .checked_add(total_credit)
+                .ok_or(MempoolError::FeeOverflow)?;
+            self.reserved_validator_credits
+                .insert(validator, total_credit);
+        }
+        let reservation = self
+            .reservations
+            .get_mut(&settlement.transaction_id)
+            .ok_or(MempoolError::MissingReservation)?;
+        reservation.settlement = Some(binding);
+        Ok(())
+    }
+
+    /// Releases a noncanonical admission and makes its maximum charge available
+    /// to the payer again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an accounting mismatch if an internal aggregate reservation no
+    /// longer contains the amount recorded for this transaction.
+    pub fn release(&mut self, transaction_id: Hash) -> Result<bool, MempoolError> {
+        let Some(reservation) = self.reservations.remove(&transaction_id) else {
+            return Ok(false);
+        };
+        subtract_accounting(
+            &mut self.reserved_by_payer,
+            reservation.payer,
+            reservation.amount,
+        )?;
+        if let Some(binding) = reservation.settlement
+            && binding.validator != reservation.payer
+        {
+            subtract_accounting(
+                &mut self.reserved_validator_credits,
+                binding.validator,
+                binding.maximum_charge,
+            )?;
+        }
+        Ok(true)
+    }
+
+    /// Charges actual compute from a prior reservation, credits the certified
+    /// validator, and releases the unused maximum back to the payer.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a missing/mismatched reservation or an executor result above the
+    /// signed compute limit. Arithmetic and balance failures are prevented by
+    /// `reserve_maximum` plus `bind_settlement`.
     pub fn settle(
         &mut self,
         settlement: &Settlement,
@@ -347,6 +515,17 @@ impl FeeLedger {
         if actual_compute > settlement.compute_limit {
             return Err(MempoolError::ComputeLimitExceeded);
         }
+        let reservation = self
+            .reservations
+            .get(&settlement.transaction_id)
+            .copied()
+            .ok_or(MempoolError::MissingReservation)?;
+        let binding = reservation
+            .settlement
+            .ok_or(MempoolError::MissingSettlementBinding)?;
+        if binding.settlement != *settlement || binding.validator != validator {
+            return Err(MempoolError::ReservationMismatch);
+        }
         let unit_price = settlement
             .local_base_fee_per_compute
             .checked_add(settlement.priority_fee_per_compute)
@@ -354,12 +533,11 @@ impl FeeLedger {
         let charged = unit_price
             .checked_mul(u128::from(actual_compute))
             .ok_or(MempoolError::FeeOverflow)?;
+        if charged > reservation.amount || charged > binding.maximum_charge {
+            return Err(MempoolError::ReservationMismatch);
+        }
         let payer = settlement.payer;
-        let payer_balance = self
-            .balances
-            .get(&payer)
-            .copied()
-            .ok_or(MempoolError::InsufficientBalance)?;
+        let payer_balance = self.balance(payer);
         let debited = payer_balance
             .checked_sub(charged)
             .ok_or(MempoolError::InsufficientBalance)?;
@@ -371,6 +549,7 @@ impl FeeLedger {
             self.balances.insert(payer, debited);
             self.balances.insert(validator, credited);
         }
+        self.release(settlement.transaction_id)?;
         Ok(FeeReceipt {
             transaction_id: settlement.transaction_id,
             payer,
@@ -378,8 +557,54 @@ impl FeeLedger {
             actual_compute,
             unit_price,
             charged,
+            reserved: reservation.amount,
+            refunded: reservation.amount - charged,
         })
     }
+}
+
+fn subtract_accounting(
+    accounting: &mut BTreeMap<Address, u128>,
+    address: Address,
+    amount: u128,
+) -> Result<(), MempoolError> {
+    // Zero-priced transactions create valid zero-value reservations. Multiple
+    // such reservations may share an address without creating positive
+    // aggregate accounting, so releasing one must not require a map entry that
+    // another zero-value release may already have removed.
+    if amount == 0 {
+        return Ok(());
+    }
+    let current = accounting
+        .get(&address)
+        .copied()
+        .ok_or(MempoolError::ReservationMismatch)?;
+    let remaining = current
+        .checked_sub(amount)
+        .ok_or(MempoolError::ReservationMismatch)?;
+    if remaining == 0 {
+        accounting.remove(&address);
+    } else {
+        accounting.insert(address, remaining);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FeeReservation {
+    transaction_id: Hash,
+    payer: Address,
+    compute_limit: u64,
+    max_fee_per_compute: u128,
+    amount: u128,
+    settlement: Option<SettlementBinding>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SettlementBinding {
+    settlement: Settlement,
+    validator: Address,
+    maximum_charge: u128,
 }
 
 /// Minimal per-transaction data needed to settle a metered fee, decoupled from
@@ -405,6 +630,8 @@ pub struct FeeReceipt {
     pub actual_compute: u64,
     pub unit_price: u128,
     pub charged: u128,
+    pub reserved: u128,
+    pub refunded: u128,
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -427,6 +654,12 @@ pub enum MempoolError {
     ComputeLimitExceeded,
     #[error("payer has insufficient balance")]
     InsufficientBalance,
+    #[error("fee reservation is missing")]
+    MissingReservation,
+    #[error("fee reservation is not yet bound to a certified settlement")]
+    MissingSettlementBinding,
+    #[error("fee reservation does not match the transaction or certified settlement")]
+    ReservationMismatch,
 }
 
 fn validate_scope(transaction: &SubmittedTransaction) -> Result<(), MempoolError> {
@@ -446,7 +679,7 @@ mod tests {
 
     use super::{
         FeeLedger, FeeScope, LocalizedMempool, MempoolError, OrderingPolicy, PendingTransaction,
-        PriorityFeePolicy, SubmittedTransaction,
+        PriorityFeePolicy, Settlement, SubmittedTransaction,
     };
 
     struct ApplicationSequence;
@@ -526,34 +759,130 @@ mod tests {
         let payer = Address::from_bytes([1; 32]);
         let validator = Address::from_bytes([2; 32]);
         let mut pool = LocalizedMempool::new(2, 0, 10).unwrap();
-        let pending = pool.submit_and_select(transaction_with_sender(1, object, 3, payer));
+        let mut transaction = transaction_with_sender(1, object, 3, payer);
+        transaction.max_fee_per_compute = 10;
+        let pending = pool.submit_and_select(transaction);
         let mut ledger = FeeLedger::default();
         ledger.credit(payer, 1_000).unwrap();
-        let receipt = ledger.settle(&pending.settlement(), 10, validator).unwrap();
+        let settlement = pending.settlement();
+        ledger
+            .reserve_maximum(
+                settlement.transaction_id,
+                payer,
+                settlement.compute_limit,
+                10,
+            )
+            .unwrap();
+        assert_eq!(ledger.available_balance(payer), 0);
+        ledger.bind_settlement(settlement, validator).unwrap();
+        let receipt = ledger.settle(&settlement, 10, validator).unwrap();
         assert_eq!(receipt.unit_price, 5);
         assert_eq!(receipt.charged, 50);
+        assert_eq!(receipt.reserved, 1_000);
+        assert_eq!(receipt.refunded, 950);
         assert_eq!(ledger.balance(payer), 950);
+        assert_eq!(ledger.available_balance(payer), 950);
         assert_eq!(ledger.balance(validator), 50);
         assert_eq!(ledger.balance(payer) + ledger.balance(validator), 1_000);
     }
 
     #[test]
-    fn failed_validator_credit_does_not_partially_debit_payer() {
+    fn validator_credit_overflow_is_rejected_before_execution() {
         let object = Hash::digest(b"atomic-fees");
         let payer = Address::from_bytes([3; 32]);
         let validator = Address::from_bytes([4; 32]);
         let mut pool = LocalizedMempool::new(2, 0, 10).unwrap();
-        let pending = pool.submit_and_select(transaction_with_sender(1, object, 3, payer));
+        let mut transaction = transaction_with_sender(1, object, 3, payer);
+        transaction.max_fee_per_compute = 10;
+        let pending = pool.submit_and_select(transaction);
         let mut ledger = FeeLedger::default();
         ledger.credit(payer, 1_000).unwrap();
         ledger.credit(validator, u128::MAX).unwrap();
+        let settlement = pending.settlement();
+        ledger
+            .reserve_maximum(
+                settlement.transaction_id,
+                payer,
+                settlement.compute_limit,
+                10,
+            )
+            .unwrap();
 
         assert_eq!(
-            ledger.settle(&pending.settlement(), 10, validator),
+            ledger.bind_settlement(settlement, validator),
             Err(MempoolError::FeeOverflow)
         );
         assert_eq!(ledger.balance(payer), 1_000);
+        assert_eq!(ledger.available_balance(payer), 0);
         assert_eq!(ledger.balance(validator), u128::MAX);
+    }
+
+    #[test]
+    fn competing_reservations_cannot_spend_the_same_balance() {
+        let payer = Address::from_bytes([5; 32]);
+        let first = Hash::digest(b"first");
+        let second = Hash::digest(b"second");
+        let mut ledger = FeeLedger::default();
+        ledger.credit(payer, 100).unwrap();
+
+        ledger.reserve_maximum(first, payer, 10, 6).unwrap();
+        assert_eq!(ledger.available_balance(payer), 40);
+        assert_eq!(
+            ledger.reserve_maximum(second, payer, 10, 5),
+            Err(MempoolError::InsufficientBalance)
+        );
+        ledger.release(first).unwrap();
+        assert_eq!(ledger.available_balance(payer), 100);
+        ledger.reserve_maximum(second, payer, 10, 5).unwrap();
+    }
+
+    #[test]
+    fn reservation_identity_is_idempotent_but_cannot_be_rebound() {
+        let payer = Address::from_bytes([6; 32]);
+        let transaction = Hash::digest(b"idempotent");
+        let mut ledger = FeeLedger::default();
+        ledger.credit(payer, 100).unwrap();
+
+        ledger.reserve_maximum(transaction, payer, 10, 5).unwrap();
+        ledger.reserve_maximum(transaction, payer, 10, 5).unwrap();
+        assert_eq!(ledger.available_balance(payer), 50);
+        assert_eq!(
+            ledger.reserve_maximum(transaction, payer, 10, 6),
+            Err(MempoolError::ReservationMismatch)
+        );
+    }
+
+    #[test]
+    fn multiple_zero_price_reservations_settle_independently() {
+        let payer = Address::from_bytes([7; 32]);
+        let validator = Address::from_bytes([8; 32]);
+        let mut ledger = FeeLedger::default();
+
+        for label in [b"zero-one".as_slice(), b"zero-two".as_slice()] {
+            let transaction_id = Hash::digest(label);
+            let settlement = Settlement {
+                transaction_id,
+                payer,
+                compute_limit: 10,
+                local_base_fee_per_compute: 0,
+                priority_fee_per_compute: 0,
+            };
+            ledger
+                .reserve_maximum(transaction_id, payer, 10, 0)
+                .unwrap();
+            ledger.bind_settlement(settlement, validator).unwrap();
+        }
+        for label in [b"zero-one".as_slice(), b"zero-two".as_slice()] {
+            let settlement = Settlement {
+                transaction_id: Hash::digest(label),
+                payer,
+                compute_limit: 10,
+                local_base_fee_per_compute: 0,
+                priority_fee_per_compute: 0,
+            };
+            let receipt = ledger.settle(&settlement, 5, validator).unwrap();
+            assert_eq!(receipt.charged, 0);
+        }
     }
 
     impl LocalizedMempool {

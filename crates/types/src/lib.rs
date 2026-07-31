@@ -92,6 +92,16 @@ impl fmt::Display for Address {
     }
 }
 
+impl core::str::FromStr for Address {
+    type Err = hex::FromHexError;
+
+    fn from_str(encoded: &str) -> Result<Self, Self::Err> {
+        let mut bytes = [0_u8; DIGEST_LENGTH];
+        hex::decode_to_slice(encoded, &mut bytes)?;
+        Ok(Self(bytes))
+    }
+}
+
 /// Consensus slot number.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct Slot(pub u64);
@@ -183,6 +193,13 @@ mod tests {
             rng.fill_bytes(&mut public_key);
             assert_ne!(Address::derive(1, &public_key).as_bytes(), &public_key);
         }
+    }
+
+    #[test]
+    fn address_display_round_trips_through_string_parsing() {
+        let address = Address::from_bytes([0xab; 32]);
+        assert_eq!(address.to_string().parse(), Ok(address));
+        assert!("ab".parse::<Address>().is_err());
     }
 
     #[test]

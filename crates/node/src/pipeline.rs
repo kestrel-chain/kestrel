@@ -4,10 +4,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use consensus::FinalizedOrder;
+use consensus::{FinalizedOrder, Proposal};
+use crypto::{Bls12381Scheme, SignatureScheme};
 use execution::DeferredExecutionError;
 use libp2p::PeerId;
-use mempool::{FeeScope, LocalizedMempool, MempoolError, SubmittedTransaction};
+use mempool::{
+    FeeLedger, FeeScope, LocalizedMempool, MempoolError, Settlement, SubmittedTransaction,
+};
 use network::{
     GossipError, InboundShred, KestrelCast, KestrelCastConfig, KestrelCastError, NetworkHandle,
     NetworkNode, RelayCandidate, Shred,
@@ -30,6 +33,15 @@ pub struct Stage2PipelineConfig {
     pub base_fee_per_compute: u128,
     pub congestion_increment: u128,
     pub per_scope_block_limit: usize,
+    /// Total admitted transactions retained across mempool queues, proposals,
+    /// and durable replay until canonical submission or rollback.
+    pub maximum_mempool_transactions: usize,
+    /// Total canonical encoded bytes retained by those admissions.
+    pub maximum_mempool_bytes: usize,
+    /// Per-gossip-source share of the global transaction bound.
+    pub maximum_peer_mempool_transactions: usize,
+    /// Per-gossip-source share of the global byte bound.
+    pub maximum_peer_mempool_bytes: usize,
     pub kestrel_cast: KestrelCastConfig,
     pub relay_count: usize,
     pub replication_factor: usize,
@@ -87,6 +99,10 @@ impl Default for Stage2PipelineConfig {
             base_fee_per_compute: 1,
             congestion_increment: 1,
             per_scope_block_limit: 1_024,
+            maximum_mempool_transactions: 50_000,
+            maximum_mempool_bytes: 256 * 1024 * 1024,
+            maximum_peer_mempool_transactions: 5_000,
+            maximum_peer_mempool_bytes: 32 * 1024 * 1024,
             kestrel_cast: KestrelCastConfig::default(),
             relay_count: 12,
             replication_factor: 2,
@@ -125,9 +141,11 @@ impl Stage2PipelineHandle {
     pub fn submit_transaction(&self, transaction: Transaction) -> Result<Hash, PipelineError> {
         let bytes = bcs::to_bytes(&transaction)
             .map_err(|error| PipelineError::Encoding(error.to_string()))?;
-        let id = self.source.admit(transaction)?;
+        let (id, inserted) = self.source.admit(transaction, None)?;
         if let Err(error) = self.network.try_publish_transaction(bytes) {
-            self.source.rollback(id)?;
+            if inserted {
+                self.source.rollback(id)?;
+            }
             return Err(error.into());
         }
         Ok(id)
@@ -223,6 +241,12 @@ impl Stage2Pipeline {
             || config.replication_factor == 0
             || config.maximum_inflight_shred_blocks == 0
             || config.maximum_pending_orders == 0
+            || config.maximum_mempool_transactions == 0
+            || config.maximum_mempool_bytes == 0
+            || config.maximum_peer_mempool_transactions == 0
+            || config.maximum_peer_mempool_bytes == 0
+            || config.maximum_peer_mempool_transactions > config.maximum_mempool_transactions
+            || config.maximum_peer_mempool_bytes > config.maximum_mempool_bytes
             || config.payload_repair_delay.is_zero()
             || config.commit_poll_interval.is_zero()
         {
@@ -262,6 +286,9 @@ impl Stage2Pipeline {
                 mempool,
                 transactions: BTreeMap::new(),
                 reserved_senders: BTreeMap::new(),
+                admission_accounting: BTreeMap::new(),
+                admitted_bytes: 0,
+                peer_admissions: BTreeMap::new(),
                 next_nonces: lifecycle.admission_nonces(),
                 arrival_sequence: 0,
                 payloads: BTreeMap::new(),
@@ -279,6 +306,16 @@ impl Stage2Pipeline {
                 recent_payloads: BTreeMap::new(),
             }),
             validator: TransactionValidator::from_genesis(genesis)?,
+            fee_ledger: lifecycle.fee_ledger_handle(),
+            validator_fee_addresses: genesis
+                .validators
+                .iter()
+                .map(|entry| {
+                    Bls12381Scheme
+                        .address(&entry.validator.public_key)
+                        .map(|address| (entry.validator.id, address))
+                })
+                .collect::<Result<_, _>>()?,
             network: network_node.handle.clone(),
             validator_peers,
             candidates,
@@ -290,9 +327,18 @@ impl Stage2Pipeline {
         // nonces above, so an entry already finalized before the crash is
         // naturally rejected as stale here rather than silently reinstated.
         for (key, value) in admission_store.iterate_prefix(ADMISSION_KEY_PREFIX)? {
-            let restore = bcs::from_bytes::<Transaction>(&value)
-                .map_err(|error| PipelineError::Encoding(error.to_string()))
-                .and_then(|transaction| source.admit(transaction));
+            let restore = decode_durable_admission(&value).and_then(|record| {
+                source
+                    .admit(
+                        record.transaction,
+                        record
+                            .source
+                            .map(|bytes| PeerId::from_bytes(&bytes))
+                            .transpose()
+                            .map_err(|error| PipelineError::Encoding(error.to_string()))?,
+                    )
+                    .map(|_| ())
+            });
             if let Err(error) = restore {
                 debug!(%error, "dropping stale persisted admission on restart");
                 admission_store.delete(&key)?;
@@ -365,7 +411,9 @@ impl Stage2Pipeline {
                 // finalized orders, and our own lifecycle/commit path) treat
                 // failure as fatal.
                 Some(transaction) = self.inbound_transactions.recv() => {
-                    if let Err(error) = self.handle_inbound_transaction(&transaction.bytes) {
+                    if let Err(error) =
+                        self.handle_inbound_transaction(&transaction.bytes, transaction.source)
+                    {
                         debug!(%error, "rejected inbound gossiped transaction");
                         if let Some(peer) = transaction.source
                             && is_peer_misbehaviour(&error)
@@ -444,10 +492,14 @@ impl Stage2Pipeline {
     /// attributable to untrusted network input (malformed bytes, an invalid
     /// signature, a stale nonce, a full mempool scope, ...) and must be
     /// rejected without affecting any other transaction or peer.
-    fn handle_inbound_transaction(&self, bytes: &[u8]) -> Result<(), PipelineError> {
+    fn handle_inbound_transaction(
+        &self,
+        bytes: &[u8],
+        source: Option<PeerId>,
+    ) -> Result<(), PipelineError> {
         let transaction = bcs::from_bytes::<Transaction>(bytes)
             .map_err(|error| PipelineError::Encoding(error.to_string()))?;
-        self.source.admit(transaction)?;
+        self.source.admit(transaction, source)?;
         Ok(())
     }
 
@@ -462,7 +514,7 @@ impl Stage2Pipeline {
                 self.network.try_send_shred(peer, inbound.shred.clone())?;
             }
         }
-        self.source.record_shred(inbound.shred)
+        self.source.record_shred(inbound.shred, inbound.source)
     }
 
     /// Re-sends a height's shreds to a peer that could not reconstruct it.
@@ -658,6 +710,9 @@ struct PipelineState {
     mempool: LocalizedMempool,
     transactions: BTreeMap<Hash, Transaction>,
     reserved_senders: BTreeMap<Address, Hash>,
+    admission_accounting: BTreeMap<Hash, AdmissionAccounting>,
+    admitted_bytes: usize,
+    peer_admissions: BTreeMap<PeerId, AdmissionUsage>,
     next_nonces: BTreeMap<Address, u64>,
     arrival_sequence: u64,
     /// Candidate payloads for heights not yet submitted, keyed by height plus a
@@ -753,6 +808,8 @@ pub struct ShredStats {
 struct PipelineProposalSource {
     state: Mutex<PipelineState>,
     validator: TransactionValidator,
+    fee_ledger: Arc<Mutex<FeeLedger>>,
+    validator_fee_addresses: BTreeMap<Hash, Address>,
     network: NetworkHandle,
     validator_peers: BTreeMap<Hash, PeerId>,
     candidates: Vec<RelayCandidate>,
@@ -772,6 +829,24 @@ const BAN_KEY_PREFIX: &[u8] = b"pipeline/ban/v1/";
 /// which the replica correctly refuses to double-vote for, while its earlier
 /// order vote also prevents a timeout vote in that view.
 const PROPOSAL_KEY_PREFIX: &[u8] = b"pipeline/proposal/v1/";
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct DurableAdmission {
+    transaction: Transaction,
+    source: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AdmissionUsage {
+    transactions: usize,
+    bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdmissionAccounting {
+    source: Option<PeerId>,
+    bytes: usize,
+}
 /// Executed heights whose payloads stay available *in memory* to answer a
 /// repair request on the hot path.
 const RETAINED_PAYLOADS_FOR_REPAIR: usize = 64;
@@ -798,6 +873,49 @@ fn admission_key(id: Hash) -> Vec<u8> {
     let mut key = ADMISSION_KEY_PREFIX.to_vec();
     key.extend_from_slice(id.as_bytes());
     key
+}
+
+fn decode_durable_admission(bytes: &[u8]) -> Result<DurableAdmission, PipelineError> {
+    if let Ok(record) = bcs::from_bytes::<DurableAdmission>(bytes) {
+        return Ok(record);
+    }
+    bcs::from_bytes::<Transaction>(bytes)
+        .map(|transaction| DurableAdmission {
+            transaction,
+            source: None,
+        })
+        .map_err(|error| PipelineError::Encoding(error.to_string()))
+}
+
+fn remove_admission_accounting(
+    state: &mut PipelineState,
+    transaction_id: Hash,
+) -> Result<(), PipelineError> {
+    let Some(accounting) = state.admission_accounting.remove(&transaction_id) else {
+        return Ok(());
+    };
+    state.admitted_bytes = state
+        .admitted_bytes
+        .checked_sub(accounting.bytes)
+        .ok_or(PipelineError::AdmissionAccountingCorrupt)?;
+    if let Some(peer) = accounting.source {
+        let usage = state
+            .peer_admissions
+            .get_mut(&peer)
+            .ok_or(PipelineError::AdmissionAccountingCorrupt)?;
+        usage.transactions = usage
+            .transactions
+            .checked_sub(1)
+            .ok_or(PipelineError::AdmissionAccountingCorrupt)?;
+        usage.bytes = usage
+            .bytes
+            .checked_sub(accounting.bytes)
+            .ok_or(PipelineError::AdmissionAccountingCorrupt)?;
+        if usage.transactions == 0 {
+            state.peer_admissions.remove(&peer);
+        }
+    }
+    Ok(())
 }
 
 fn payload_history_key(height: u64) -> Vec<u8> {
@@ -889,12 +1007,48 @@ fn persist_proposal(store: &RocksDbStore, payload: &PropagatedBlock) -> Result<(
     Ok(())
 }
 
+fn check_admission_capacity(
+    transaction_count: usize,
+    admitted_bytes: usize,
+    peer_usage: AdmissionUsage,
+    config: &Stage2PipelineConfig,
+    source: Option<PeerId>,
+    encoded_size: usize,
+) -> Result<(), PipelineError> {
+    if transaction_count >= config.maximum_mempool_transactions {
+        return Err(PipelineError::MempoolTransactionLimitReached);
+    }
+    if admitted_bytes
+        .checked_add(encoded_size)
+        .is_none_or(|total| total > config.maximum_mempool_bytes)
+    {
+        return Err(PipelineError::MempoolByteLimitReached);
+    }
+    if let Some(peer) = source {
+        if peer_usage.transactions >= config.maximum_peer_mempool_transactions {
+            return Err(PipelineError::PeerMempoolTransactionLimitReached(peer));
+        }
+        if peer_usage
+            .bytes
+            .checked_add(encoded_size)
+            .is_none_or(|total| total > config.maximum_peer_mempool_bytes)
+        {
+            return Err(PipelineError::PeerMempoolByteLimitReached(peer));
+        }
+    }
+    Ok(())
+}
+
 impl PipelineProposalSource {
-    fn admit(&self, transaction: Transaction) -> Result<Hash, PipelineError> {
+    fn admit(
+        &self,
+        transaction: Transaction,
+        source: Option<PeerId>,
+    ) -> Result<(Hash, bool), PipelineError> {
         let (id, payload) = self.validator.validate(&transaction)?;
         let mut state = self.state.lock().map_err(|_| PipelineError::LockPoisoned)?;
         if state.transactions.contains_key(&id) {
-            return Ok(id);
+            return Ok((id, false));
         }
         let expected = state
             .next_nonces
@@ -922,11 +1076,44 @@ impl PipelineProposalSource {
             .copied()
             .map_or(FeeScope::Account(transaction.sender), FeeScope::Object);
         let arrival_sequence = state.arrival_sequence;
-        // Persist before any in-memory mutation: if this fails, admission
-        // aborts cleanly with no partial mempool/reservation state to unwind.
-        let encoded = bcs::to_bytes(&transaction)
+        let transaction_bytes = bcs::to_bytes(&transaction)
             .map_err(|error| PipelineError::Encoding(error.to_string()))?;
-        self.admission_store.put(&admission_key(id), &encoded)?;
+        let encoded_size = transaction_bytes.len();
+        let peer_usage = source
+            .and_then(|peer| state.peer_admissions.get(&peer).copied())
+            .unwrap_or_default();
+        check_admission_capacity(
+            state.transactions.len(),
+            state.admitted_bytes,
+            peer_usage,
+            &self.config,
+            source,
+            encoded_size,
+        )?;
+        let admitted_bytes = state.admitted_bytes + encoded_size;
+        let mut fee_ledger = self
+            .fee_ledger
+            .lock()
+            .map_err(|_| PipelineError::LockPoisoned)?;
+        fee_ledger.reserve_maximum(
+            id,
+            transaction.sender,
+            payload.executable.compute_limit,
+            payload.max_fee_per_compute,
+        )?;
+        // Persist after reservation validation but before exposing any
+        // in-memory admission. If persistence fails, release the reservation
+        // and leave no partial queue/accounting state.
+        let durable = DurableAdmission {
+            transaction: transaction.clone(),
+            source: source.map(PeerId::to_bytes),
+        };
+        let encoded =
+            bcs::to_bytes(&durable).map_err(|error| PipelineError::Encoding(error.to_string()))?;
+        if let Err(error) = self.admission_store.put(&admission_key(id), &encoded) {
+            fee_ledger.release(id)?;
+            return Err(error.into());
+        }
         state.arrival_sequence = state.arrival_sequence.saturating_add(1);
         if let Err(error) = state.mempool.submit(SubmittedTransaction {
             id,
@@ -941,15 +1128,29 @@ impl PipelineProposalSource {
         }) {
             // Nothing durable should outlive a rejected admission.
             self.admission_store.delete(&admission_key(id))?;
+            fee_ledger.release(id)?;
             return Err(error.into());
         }
         let sender = transaction.sender;
         state.reserved_senders.insert(sender, id);
         state.transactions.insert(id, transaction);
+        state.admitted_bytes = admitted_bytes;
+        state.admission_accounting.insert(
+            id,
+            AdmissionAccounting {
+                source,
+                bytes: encoded_size,
+            },
+        );
+        if let Some(peer) = source {
+            let usage = state.peer_admissions.entry(peer).or_default();
+            usage.transactions += 1;
+            usage.bytes += encoded_size;
+        }
         // One event per transaction per validator floods a debug capture,
         // so this stays at trace; `profile_pipeline` enables trace to read it.
         trace!(transaction_id = %id, %sender, "admitted transaction");
-        Ok(id)
+        Ok((id, true))
     }
 
     fn rollback(&self, id: Hash) -> Result<(), PipelineError> {
@@ -960,6 +1161,11 @@ impl PipelineProposalSource {
         if let Some(transaction) = state.transactions.remove(&id) {
             state.reserved_senders.remove(&transaction.sender);
         }
+        remove_admission_accounting(&mut state, id)?;
+        self.fee_ledger
+            .lock()
+            .map_err(|_| PipelineError::LockPoisoned)?
+            .release(id)?;
         self.admission_store.delete(&admission_key(id))?;
         Ok(())
     }
@@ -1075,7 +1281,7 @@ impl PipelineProposalSource {
         Ok(())
     }
 
-    fn record_shred(&self, shred: Shred) -> Result<(), PipelineError> {
+    fn record_shred(&self, shred: Shred, source: PeerId) -> Result<(), PipelineError> {
         let block_id = shred.block_id;
         let data_shards = usize::from(shred.data_shards);
         let candidate = {
@@ -1101,7 +1307,7 @@ impl PipelineProposalSource {
         };
         let payload = PropagatedBlock::from_shreds(&shreds)?;
         for transaction in &payload.transactions {
-            self.validator.validate(transaction)?;
+            self.admit(transaction.clone(), Some(source))?;
         }
         // Key a reconstructed payload by its own identity, not by its parent.
         // Different leaders in different views propose *different* payloads for
@@ -1181,6 +1387,7 @@ impl PipelineProposalSource {
         for transaction in &payload.transactions {
             if let Some(reserved) = state.reserved_senders.remove(&transaction.sender) {
                 state.transactions.remove(&reserved);
+                remove_admission_accounting(&mut state, reserved)?;
             }
             state.next_nonces.insert(
                 transaction.sender,
@@ -1192,7 +1399,9 @@ impl PipelineProposalSource {
         }
         state.mempool.remove_transactions(&ids);
         for id in ids {
-            state.transactions.remove(&id);
+            if state.transactions.remove(&id).is_some() {
+                remove_admission_accounting(&mut state, id)?;
+            }
             self.admission_store.delete(&admission_key(id))?;
         }
         state
@@ -1235,6 +1444,85 @@ impl ProposalTransactionSource for PipelineProposalSource {
             .lock()
             .is_ok_and(|state| state.transactions.is_empty())
     }
+
+    fn proposal_is_admissible(&self, proposal: &Proposal) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        let Some(payload) = state.payloads.values().find(|payload| {
+            payload.height == proposal.height
+                && payload.parent_id == proposal.parent_id
+                && payload.fee_commitment() == proposal.fee_commitment
+                && payload
+                    .transaction_ids()
+                    .is_ok_and(|ids| ids == proposal.transaction_ids)
+        }) else {
+            // Voting is fail-closed without the exact payload, but the order is
+            // not finalized yet so the ordinary finalized-order repair loop
+            // cannot know to ask for it. Request it directly from the proposer;
+            // repeated proposal delivery naturally retries this bounded
+            // network request after transient shred loss/outage.
+            if let Some(peer) = self.validator_peers.get(&proposal.proposer)
+                && let Err(error) = self.network.try_request_payload(*peer, proposal.height)
+            {
+                debug!(
+                    %peer,
+                    height = proposal.height,
+                    %error,
+                    "could not queue pre-vote payload repair request"
+                );
+            }
+            return false;
+        };
+        if payload.transactions.len() != payload.base_fees.len() {
+            return false;
+        }
+        let Some(&validator) = self.validator_fee_addresses.get(&proposal.proposer) else {
+            return false;
+        };
+        let Ok(ledger) = self.fee_ledger.lock() else {
+            return false;
+        };
+        let mut candidate = ledger.clone();
+        for ((transaction, &transaction_id), &base_fee_per_compute) in payload
+            .transactions
+            .iter()
+            .zip(&proposal.transaction_ids)
+            .zip(&payload.base_fees)
+        {
+            if !state.transactions.contains_key(&transaction_id) {
+                return false;
+            }
+            let Ok((validated_id, signed)) = self.validator.validate(transaction) else {
+                return false;
+            };
+            if validated_id != transaction_id
+                || candidate
+                    .reserve_maximum(
+                        transaction_id,
+                        transaction.sender,
+                        signed.executable.compute_limit,
+                        signed.max_fee_per_compute,
+                    )
+                    .is_err()
+                || candidate
+                    .bind_settlement(
+                        Settlement {
+                            transaction_id,
+                            payer: transaction.sender,
+                            compute_limit: signed.executable.compute_limit,
+                            local_base_fee_per_compute: base_fee_per_compute,
+                            priority_fee_per_compute: signed.priority_fee_per_compute,
+                        },
+                        validator,
+                    )
+                    .is_err()
+            {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Failures at the integrated Stage 2 transport/order/execution boundary.
@@ -1246,6 +1534,16 @@ pub enum PipelineError {
     InvalidPeerTopology,
     #[error("the sender already has an uncommitted transaction reserved: {0}")]
     SenderAlreadyReserved(Address),
+    #[error("the global mempool transaction limit was reached")]
+    MempoolTransactionLimitReached,
+    #[error("the global mempool byte limit was reached")]
+    MempoolByteLimitReached,
+    #[error("gossip peer {0} reached its mempool transaction limit")]
+    PeerMempoolTransactionLimitReached(PeerId),
+    #[error("gossip peer {0} reached its mempool byte limit")]
+    PeerMempoolByteLimitReached(PeerId),
+    #[error("mempool admission accounting is internally inconsistent")]
+    AdmissionAccountingCorrupt,
     #[error("transaction nonce mismatch: expected {expected}, received {received}")]
     NonceMismatch { expected: u64, received: u64 },
     #[error("transaction nonce overflow")]
@@ -1274,6 +1572,8 @@ pub enum PipelineError {
     Encoding(String),
     #[error(transparent)]
     Lifecycle(#[from] LifecycleError),
+    #[error(transparent)]
+    Crypto(#[from] crypto::CryptoError),
     #[error(transparent)]
     Mempool(#[from] MempoolError),
     #[error(transparent)]
@@ -1339,6 +1639,10 @@ fn is_peer_misbehaviour(error: &PipelineError) -> bool {
         // Ordinary races between commit and in-flight gossip.
         PipelineError::NonceMismatch { .. }
             | PipelineError::SenderAlreadyReserved(_)
+            | PipelineError::MempoolTransactionLimitReached
+            | PipelineError::MempoolByteLimitReached
+            | PipelineError::PeerMempoolTransactionLimitReached(_)
+            | PipelineError::PeerMempoolByteLimitReached(_)
             // Local congestion/limits, not the sender's doing. Gossip errors
             // here come from relaying a peer's shred failing because our own
             // outbound queue is full -- backpressure under load, never the
@@ -1349,6 +1653,7 @@ fn is_peer_misbehaviour(error: &PipelineError) -> bool {
             | PipelineError::Gossip(_)
             // Our own internal faults are never the peer's fault.
             | PipelineError::LockPoisoned
+            | PipelineError::AdmissionAccountingCorrupt
             | PipelineError::Storage(_)
     )
 }
@@ -1363,11 +1668,75 @@ mod tests {
     use types::Hash;
 
     use super::{
-        BAN_KEY_PREFIX, DURABLE_PAYLOAD_HISTORY, PipelineError, PropagatedBlock,
-        is_peer_misbehaviour, persist_ban, persist_payload_history, persist_proposal,
-        persisted_bans, persisted_payload_at_height, persisted_proposal, proposal_key,
-        rotating_peer_index, tally_offense,
+        AdmissionUsage, BAN_KEY_PREFIX, DURABLE_PAYLOAD_HISTORY, PipelineError, PropagatedBlock,
+        Stage2PipelineConfig, check_admission_capacity, is_peer_misbehaviour, persist_ban,
+        persist_payload_history, persist_proposal, persisted_bans, persisted_payload_at_height,
+        persisted_proposal, proposal_key, rotating_peer_index, tally_offense,
     };
+
+    #[test]
+    fn admission_capacity_enforces_global_and_per_peer_count_and_byte_limits() {
+        let peer = PeerId::random();
+        let config = Stage2PipelineConfig {
+            maximum_mempool_transactions: 2,
+            maximum_mempool_bytes: 100,
+            maximum_peer_mempool_transactions: 1,
+            maximum_peer_mempool_bytes: 60,
+            ..Stage2PipelineConfig::default()
+        };
+
+        assert!(matches!(
+            check_admission_capacity(2, 0, AdmissionUsage::default(), &config, None, 1),
+            Err(PipelineError::MempoolTransactionLimitReached)
+        ));
+        assert!(matches!(
+            check_admission_capacity(0, 90, AdmissionUsage::default(), &config, None, 11),
+            Err(PipelineError::MempoolByteLimitReached)
+        ));
+        assert!(matches!(
+            check_admission_capacity(
+                0,
+                0,
+                AdmissionUsage {
+                    transactions: 1,
+                    bytes: 1,
+                },
+                &config,
+                Some(peer),
+                1
+            ),
+            Err(PipelineError::PeerMempoolTransactionLimitReached(rejected)) if rejected == peer
+        ));
+        assert!(matches!(
+            check_admission_capacity(
+                0,
+                0,
+                AdmissionUsage {
+                    transactions: 0,
+                    bytes: 55,
+                },
+                &config,
+                Some(peer),
+                6
+            ),
+            Err(PipelineError::PeerMempoolByteLimitReached(rejected)) if rejected == peer
+        ));
+
+        assert!(
+            check_admission_capacity(
+                1,
+                50,
+                AdmissionUsage {
+                    transactions: 0,
+                    bytes: 50,
+                },
+                &config,
+                Some(peer),
+                10
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn a_single_missing_height_rotates_across_repair_peers() {

@@ -65,8 +65,52 @@ pub struct GenesisDocument {
     /// Fee-ledger balances seeded at genesis, keyed by sender address. Absent
     /// senders start at a zero balance and must be funded before any of their
     /// transactions can settle (see `docs/TECH_DEBT.md` TD-011).
-    #[serde(default)]
+    #[serde(default, with = "fee_balances_serde")]
     pub initial_fee_balances: BTreeMap<Address, u128>,
+}
+
+mod fee_balances_serde {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+    use types::Address;
+
+    pub fn serialize<S>(
+        balances: &BTreeMap<Address, u128>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if serializer.is_human_readable() {
+            balances
+                .iter()
+                .map(|(address, balance)| (address.to_string(), *balance))
+                .collect::<BTreeMap<_, _>>()
+                .serialize(serializer)
+        } else {
+            balances.serialize(serializer)
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<Address, u128>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            BTreeMap::<String, u128>::deserialize(deserializer)?
+                .into_iter()
+                .map(|(address, balance)| {
+                    address
+                        .parse()
+                        .map(|address| (address, balance))
+                        .map_err(D::Error::custom)
+                })
+                .collect()
+        } else {
+            BTreeMap::deserialize(deserializer)
+        }
+    }
 }
 
 /// Validated roots and stake table derived solely from canonical genesis.
@@ -328,7 +372,10 @@ mod tests {
             equivocation_slash_basis_points: 5_000,
             validators,
             initial_objects: objects,
-            initial_fee_balances: BTreeMap::new(),
+            initial_fee_balances: BTreeMap::from([
+                (Address::from_bytes([1; 32]), 1_000),
+                (Address::from_bytes([2; 32]), 2_000),
+            ]),
         }
     }
 }

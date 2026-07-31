@@ -13,7 +13,7 @@ The command creates `validator.key` (the BLS consensus key) and `gossip.key` (th
 Combine the public profiles into one JSON array, then create and independently validate genesis:
 
 ```sh
-cargo run -p cli -- genesis-create CHAIN_ID GENESIS_UNIX_MS validators.json genesis.json
+cargo run -p cli -- genesis-create CHAIN_ID GENESIS_UNIX_MS validators.json fee-balances.json genesis.json
 cargo run -p cli -- genesis-validate genesis.json
 ```
 

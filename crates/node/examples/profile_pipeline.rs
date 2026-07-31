@@ -659,8 +659,14 @@ fn fixture_genesis(
             active_signature_schemes: vec![1, 2],
             equivocation_slash_basis_points: 5_000,
             validators,
+            initial_fee_balances: initial_objects
+                .iter()
+                .filter_map(|object| match object.owner {
+                    Owner::Single(owner) => Some((owner, 10_000_000)),
+                    Owner::Shared => None,
+                })
+                .collect(),
             initial_objects,
-            initial_fee_balances: BTreeMap::new(),
         },
         keys,
         gossip_identities,

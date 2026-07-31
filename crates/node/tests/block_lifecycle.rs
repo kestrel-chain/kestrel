@@ -13,6 +13,7 @@ use execution::{
     AccessMode, DeclaredObjectRef, ExecutableTransaction, ExecutionStatus, MoveOperation,
     NATIVE_OPERATION_COMPUTE_COST,
 };
+use mempool::MempoolError;
 use network::KestrelCastConfig;
 use node::{
     BlockLifecycle, GENESIS_FORMAT_VERSION, GenesisDocument, GenesisValidator, LifecycleError,
@@ -576,11 +577,79 @@ fn committed_transaction_fee_is_debited_from_payer_and_credited_to_the_leader() 
     )
     .unwrap();
     lifecycle.submit_payload(order, &payload).unwrap();
+    let fee_ledger = lifecycle.fee_ledger_handle();
+    assert_eq!(
+        fee_ledger.lock().unwrap().available_balance(owner),
+        0,
+        "admission must reserve the signed maximum before execution"
+    );
     wait_for_commit(&mut lifecycle);
 
     let expected_charge = 5_u128 * u128::from(NATIVE_OPERATION_COMPUTE_COST);
     assert_eq!(lifecycle.fee_balance(owner), 10_000 - expected_charge);
     assert_eq!(lifecycle.fee_balance(leader_address), expected_charge);
+    assert_eq!(
+        fee_ledger.lock().unwrap().available_balance(owner),
+        10_000 - expected_charge,
+        "unused maximum fee must be available again after settlement"
+    );
+}
+
+#[test]
+fn an_unfunded_finalized_payload_is_rejected_before_execution() {
+    let directory = TempDir::new().unwrap();
+    let account_key = [12_u8; 32];
+    let account_public_key = Ed25519Scheme.public_key(&account_key).unwrap();
+    let owner = Ed25519Scheme.address(&account_public_key).unwrap();
+    let first = object(1, owner);
+    let (mut genesis, validator_keys) = genesis(vec![first.clone()]);
+    // The signed maximum is 10 * 1,000 = 10,000, so even one unit less must
+    // fail closed instead of executing and discovering insolvency at commit.
+    genesis.initial_fee_balances.insert(owner, 9_999);
+    let validated = genesis.validate().unwrap();
+    let status = status(&genesis, validated.genesis_hash, validated.state_root);
+    let shared_state = Arc::new(RwLock::new(StateTree::new(StateConfig::default()).unwrap()));
+    let payload = PropagatedBlock {
+        height: 1,
+        parent_id: validated.genesis_hash,
+        transactions: vec![signed_mutation_with_fee_bid(
+            &account_key,
+            &account_public_key,
+            owner,
+            0,
+            &first,
+            0,
+            42,
+            10,
+            2,
+        )],
+        base_fees: vec![3],
+    };
+    let order = finalized_order(&genesis, &validator_keys, &payload);
+    let mut lifecycle = BlockLifecycle::open(
+        &genesis,
+        directory.path(),
+        Arc::clone(&status),
+        Arc::clone(&shared_state),
+        100,
+        4,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        lifecycle.submit_payload(order, &payload),
+        Err(LifecycleError::Mempool(MempoolError::InsufficientBalance))
+    ));
+    assert_eq!(lifecycle.submitted_height(), 0);
+    assert_eq!(
+        shared_state
+            .read()
+            .unwrap()
+            .object(&first.id)
+            .unwrap()
+            .version,
+        0
+    );
 }
 
 #[test]
@@ -801,6 +870,14 @@ fn finalized_order(
 fn genesis(initial_objects: Vec<Object>) -> (GenesisDocument, BTreeMap<Hash, Vec<u8>>) {
     let scheme = Bls12381Scheme;
     let mut keys = BTreeMap::new();
+    let initial_fee_balances = [99_u8, 77, 7, 8, 11, 12]
+        .into_iter()
+        .map(|seed| {
+            let public_key = Ed25519Scheme.public_key(&[seed; 32]).unwrap();
+            let address = Ed25519Scheme.address(&public_key).unwrap();
+            (address, 10_000_000)
+        })
+        .collect();
     let validators = (1_u8..=4)
         .map(|index| {
             let key = vec![index; 32];
@@ -835,7 +912,7 @@ fn genesis(initial_objects: Vec<Object>) -> (GenesisDocument, BTreeMap<Hash, Vec
             equivocation_slash_basis_points: 5_000,
             validators,
             initial_objects,
-            initial_fee_balances: BTreeMap::new(),
+            initial_fee_balances,
         },
         keys,
     )

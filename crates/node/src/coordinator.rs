@@ -180,6 +180,15 @@ enum WireMessage {
 pub trait ProposalTransactionSource: Send + Sync {
     fn transaction_ids(&self, height: u64, parent_id: Hash) -> Option<(Vec<Hash>, Hash)>;
 
+    /// Reports whether this node has reconstructed and admitted the exact
+    /// payload behind a proposal. Production sources use this to refuse an
+    /// order vote until transaction funding and certified fee settlement have
+    /// been checked locally; synthetic/test sources retain the permissive
+    /// default.
+    fn proposal_is_admissible(&self, _proposal: &Proposal) -> bool {
+        true
+    }
+
     /// Reports whether asking for a proposal now would snapshot an empty
     /// transaction set. Sources that cannot answer cheaply should retain the
     /// default and will not be delayed.
@@ -526,6 +535,9 @@ impl ConsensusCoordinator {
                 .is_some_and(|received| received.elapsed() >= self.config.proposal_vote_delay)
             && let Some(signed) = round.observed_proposals.values().next()
             && !round.has(RoundFlag::ProposalVoteSent)
+            && self
+                .proposal_source
+                .proposal_is_admissible(&signed.proposal)
         {
             let voted = skip_safe_vote_refusal(self.replica.vote_for_proposal(&signed.proposal));
             // Marked either way: a view this replica has already timed out

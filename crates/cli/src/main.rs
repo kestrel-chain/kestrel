@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use consensus::Validator;
 use crypto::{Bls12381Scheme, SignatureScheme};
 use node::{GENESIS_FORMAT_VERSION, GenesisDocument, GenesisValidator};
-use types::Hash;
+use types::{Address, Hash};
 
 fn main() -> Result<()> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
@@ -24,7 +24,7 @@ fn main() -> Result<()> {
                 "\n",
                 "commands:\n",
                 "  validator-init NAME STAKE NETWORK_ADDRESS RPC_ADDRESS GOSSIP_ADDRESS OUTPUT_DIR\n",
-                "  genesis-create CHAIN_ID GENESIS_UNIX_MS VALIDATORS_JSON OUTPUT_JSON\n",
+                "  genesis-create CHAIN_ID GENESIS_UNIX_MS VALIDATORS_JSON FEE_BALANCES_JSON OUTPUT_JSON\n",
                 "  genesis-validate GENESIS_JSON"
             ));
             Ok(())
@@ -85,10 +85,26 @@ fn validator_init(arguments: &[String]) -> Result<()> {
 }
 
 fn genesis_create(arguments: &[String]) -> Result<()> {
-    if arguments.len() != 4 {
-        bail!("genesis-create requires CHAIN_ID GENESIS_UNIX_MS VALIDATORS_JSON OUTPUT_JSON");
+    if arguments.len() != 5 {
+        bail!(
+            "genesis-create requires CHAIN_ID GENESIS_UNIX_MS VALIDATORS_JSON FEE_BALANCES_JSON OUTPUT_JSON"
+        );
     }
     let validators = serde_json::from_slice::<Vec<GenesisValidator>>(&fs::read(&arguments[2])?)?;
+    let initial_fee_balances =
+        serde_json::from_slice::<BTreeMap<String, u128>>(&fs::read(&arguments[3])?)
+            .context("fee balances must be a JSON object mapping addresses to u128 amounts")?
+            .into_iter()
+            .map(|(address, balance)| {
+                address
+                    .parse::<Address>()
+                    .map(|address| (address, balance))
+                    .with_context(|| format!("invalid fee-balance address {address}"))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+    if initial_fee_balances.is_empty() {
+        bail!("fee balances must fund at least one account");
+    }
     let document = GenesisDocument {
         format_version: GENESIS_FORMAT_VERSION,
         chain_id: arguments[0].clone(),
@@ -101,9 +117,9 @@ fn genesis_create(arguments: &[String]) -> Result<()> {
         equivocation_slash_basis_points: 5_000,
         validators,
         initial_objects: Vec::new(),
-        initial_fee_balances: BTreeMap::new(),
+        initial_fee_balances,
     };
-    document.write_json(&arguments[3])?;
+    document.write_json(&arguments[4])?;
     let validated = document.validate()?;
     println!(
         "genesis={} state_root={}",

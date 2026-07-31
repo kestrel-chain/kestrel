@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     path::Path,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use consensus::{
@@ -15,14 +15,14 @@ use execution::{
     DeferredExecutionError, DeferredExecutionResult, DeferredExecutor, ExecutableTransaction,
     ExecutionError, ExecutionReceipt, OrderedExecutionBlock,
 };
-use mempool::{FeeLedger, Settlement};
+use mempool::{FeeLedger, MempoolError, Settlement};
 use network::{KestrelCast, KestrelCastConfig, KestrelCastError, Shred};
 use rpc::NodeStatus;
 use serde::{Deserialize, Serialize};
 use state::{StateError, StateSnapshot, StateTree};
 use storage::{KvStore, RocksDbStore, StorageError, WriteBatch};
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::debug;
 use types::{Address, Hash, Transaction};
 
 use crate::{GenesisDocument, GenesisError};
@@ -221,6 +221,7 @@ struct DurableCheckpoint {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct PendingTransactionExecution {
     executable: ExecutableTransaction,
+    max_fee_per_compute: u128,
     base_fee_per_compute: u128,
     priority_fee_per_compute: u128,
 }
@@ -255,7 +256,7 @@ pub struct BlockLifecycle {
     admission_nonces: BTreeMap<Address, u64>,
     pending: BTreeMap<u64, PendingBlock>,
     completed: Option<DeferredExecutionResult>,
-    fee_ledger: FeeLedger,
+    fee_ledger: Arc<Mutex<FeeLedger>>,
 }
 
 impl BlockLifecycle {
@@ -265,7 +266,7 @@ impl BlockLifecycle {
     ///
     /// Rejects invalid genesis/checkpoint data, storage failures, worker setup
     /// failures, or poisoned shared RPC state.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn open(
         genesis: &GenesisDocument,
         data_directory: impl AsRef<Path>,
@@ -304,7 +305,9 @@ impl BlockLifecycle {
             store.put(CHECKPOINT_KEY, &canonical_bytes(&checkpoint)?)?;
             checkpoint
         };
-        let fee_ledger = FeeLedger::from_balances(checkpoint.fee_balances.clone());
+        let fee_ledger = Arc::new(Mutex::new(FeeLedger::from_balances(
+            checkpoint.fee_balances.clone(),
+        )));
         let state = StateTree::from_durable_snapshot(checkpoint.state.clone())?;
         {
             let mut shared = rpc_state
@@ -343,6 +346,17 @@ impl BlockLifecycle {
                     expected: submitted_height.saturating_add(1),
                     found: record.order.height,
                 });
+            }
+            {
+                let mut ledger = fee_ledger
+                    .lock()
+                    .map_err(|_| LifecycleError::LockPoisoned)?;
+                prepare_fee_reservations(
+                    &mut ledger,
+                    &record,
+                    &validated.validators,
+                    &Bls12381Scheme,
+                )?;
             }
             executor.submit(OrderedExecutionBlock {
                 height: record.order.height,
@@ -439,6 +453,7 @@ impl BlockLifecycle {
             transaction_ids.push(id);
             executions.push(PendingTransactionExecution {
                 executable: signed.executable,
+                max_fee_per_compute: signed.max_fee_per_compute,
                 base_fee_per_compute,
                 priority_fee_per_compute: signed.priority_fee_per_compute,
             });
@@ -469,6 +484,17 @@ impl BlockLifecycle {
             next_nonces,
             transactions: executions,
         };
+        let mut fee_ledger = self
+            .fee_ledger
+            .lock()
+            .map_err(|_| LifecycleError::LockPoisoned)?;
+        let mut prepared_fee_ledger = fee_ledger.clone();
+        prepare_fee_reservations(
+            &mut prepared_fee_ledger,
+            &pending,
+            &self.validators,
+            self.scheme.as_ref(),
+        )?;
         // Durably record the block before handing it to the executor so a
         // crash never strands a validated, in-flight block: on restart the
         // record is replayed and resubmitted rather than lost, sparing the
@@ -488,6 +514,8 @@ impl BlockLifecycle {
             let _ = self.store.delete(&pending_key(height));
             return Err(error.into());
         }
+        *fee_ledger = prepared_fee_ledger;
+        drop(fee_ledger);
         self.submitted_height = height;
         self.submitted_block = pending.order.block_id;
         self.admission_nonces = pending.next_nonces.clone();
@@ -538,22 +566,29 @@ impl BlockLifecycle {
             state_root: snapshot.state_root,
             certificate: pending.order.certificate.clone(),
         };
-        // Settle actual compute against the certified local base fee plus
-        // each sender's own signed priority bid, crediting the validator that
-        // led this height. A settlement failure (e.g. an unfunded payer) does
-        // not unwind an already-finalized, already-executed block — it is
-        // only ever logged.
+        // Settle actual compute from the maximum reservations established
+        // before honest validators voted for this payload. Work on a clone and
+        // publish it only after the RocksDB batch succeeds, so storage failure
+        // cannot partially mutate the in-memory fee ledger.
         let leader = self
             .validators
             .leader(pending.order.height, pending.order.certificate.view);
         let leader_address = self.scheme.address(&leader.public_key)?;
+        let mut fee_ledger = self
+            .fee_ledger
+            .lock()
+            .map_err(|_| LifecycleError::LockPoisoned)?;
+        let mut settled_fee_ledger = fee_ledger.clone();
         for receipt in &result.receipts {
-            let (Some(execution), Some(&transaction_id)) = (
-                pending.transactions.get(receipt.transaction_index),
-                pending.order.transaction_ids.get(receipt.transaction_index),
-            ) else {
-                continue;
-            };
+            let execution = pending
+                .transactions
+                .get(receipt.transaction_index)
+                .ok_or(LifecycleError::CommitOrderMismatch)?;
+            let transaction_id = *pending
+                .order
+                .transaction_ids
+                .get(receipt.transaction_index)
+                .ok_or(LifecycleError::CommitOrderMismatch)?;
             let settlement = Settlement {
                 transaction_id,
                 payer: execution.executable.operation.sender(),
@@ -561,17 +596,7 @@ impl BlockLifecycle {
                 local_base_fee_per_compute: execution.base_fee_per_compute,
                 priority_fee_per_compute: execution.priority_fee_per_compute,
             };
-            if let Err(error) =
-                self.fee_ledger
-                    .settle(&settlement, receipt.compute_used, leader_address)
-            {
-                warn!(
-                    %error,
-                    height = record.height,
-                    %transaction_id,
-                    "fee settlement failed; block commit proceeds unaffected"
-                );
-            }
+            settled_fee_ledger.settle(&settlement, receipt.compute_used, leader_address)?;
         }
         let checkpoint = DurableCheckpoint {
             format_version: CHECKPOINT_FORMAT_VERSION,
@@ -579,7 +604,7 @@ impl BlockLifecycle {
             finalized_height: record.height,
             finalized_block: record.consensus_block_id,
             next_nonces: pending.next_nonces.clone(),
-            fee_balances: self.fee_ledger.balances().clone(),
+            fee_balances: settled_fee_ledger.balances().clone(),
             state: snapshot.clone(),
         };
         let mut batch = WriteBatch::new();
@@ -594,6 +619,8 @@ impl BlockLifecycle {
             );
         }
         self.store.write_batch(batch)?;
+        *fee_ledger = settled_fee_ledger;
+        drop(fee_ledger);
 
         let restored = StateTree::from_durable_snapshot(snapshot.clone())?;
         {
@@ -696,7 +723,16 @@ impl BlockLifecycle {
     /// Returns `address`'s durable fee-ledger balance.
     #[must_use]
     pub fn fee_balance(&self, address: Address) -> u128 {
-        self.fee_ledger.balance(address)
+        self.fee_ledger
+            .lock()
+            .map_or(0, |ledger| ledger.balance(address))
+    }
+
+    /// Shares the canonical fee ledger with pre-consensus admission so every
+    /// accepted transaction locks its maximum payable charge before gossip.
+    #[must_use]
+    pub fn fee_ledger_handle(&self) -> Arc<Mutex<FeeLedger>> {
+        Arc::clone(&self.fee_ledger)
     }
 
     /// Shares this node's single durable store with other components (the
@@ -728,6 +764,43 @@ fn admit(
             .ok_or(LifecycleError::NonceOverflow)?,
     );
     Ok((id, payload))
+}
+
+fn prepare_fee_reservations(
+    ledger: &mut FeeLedger,
+    pending: &PendingBlock,
+    validators: &ValidatorSet,
+    scheme: &dyn AggregateSignatureScheme,
+) -> Result<(), LifecycleError> {
+    let leader = validators.leader(pending.order.height, pending.order.certificate.view);
+    let validator = scheme.address(&leader.public_key)?;
+    if pending.transactions.len() != pending.order.transaction_ids.len() {
+        return Err(LifecycleError::FeeCountMismatch);
+    }
+    for (execution, &transaction_id) in pending
+        .transactions
+        .iter()
+        .zip(&pending.order.transaction_ids)
+    {
+        let payer = execution.executable.operation.sender();
+        ledger.reserve_maximum(
+            transaction_id,
+            payer,
+            execution.executable.compute_limit,
+            execution.max_fee_per_compute,
+        )?;
+        ledger.bind_settlement(
+            Settlement {
+                transaction_id,
+                payer,
+                compute_limit: execution.executable.compute_limit,
+                local_base_fee_per_compute: execution.base_fee_per_compute,
+                priority_fee_per_compute: execution.priority_fee_per_compute,
+            },
+            validator,
+        )?;
+    }
+    Ok(())
 }
 
 /// Returns the canonical ID of a complete signed transaction envelope.
@@ -797,6 +870,8 @@ pub enum LifecycleError {
     DeferredExecution(#[from] DeferredExecutionError),
     #[error(transparent)]
     KestrelCast(#[from] KestrelCastError),
+    #[error(transparent)]
+    Mempool(#[from] MempoolError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error("canonical lifecycle encoding failed: {0}")]

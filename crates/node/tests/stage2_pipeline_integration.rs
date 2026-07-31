@@ -237,7 +237,7 @@ async fn stage2_pipeline_commits_after_a_semantically_failing_gossiped_transacti
         equivocation_slash_basis_points: 5_000,
         validators: validators.clone(),
         initial_objects: vec![target.clone()],
-        initial_fee_balances: BTreeMap::new(),
+        initial_fee_balances: BTreeMap::from([(owner, 10_000_000)]),
     };
     let validated = genesis.validate().unwrap();
 
@@ -520,7 +520,10 @@ async fn run_concurrent_independent_senders(transaction_count: usize) {
         equivocation_slash_basis_points: 5_000,
         validators: validators.clone(),
         initial_objects: senders.iter().map(|sender| sender.object.clone()).collect(),
-        initial_fee_balances: BTreeMap::new(),
+        initial_fee_balances: senders
+            .iter()
+            .map(|sender| (sender.address, 10_000_000))
+            .collect(),
     };
     let validated = genesis.validate().unwrap();
 
@@ -867,7 +870,10 @@ async fn a_validator_that_missed_a_payload_recovers_it_from_peers() {
         equivocation_slash_basis_points: 5_000,
         validators: validators.clone(),
         initial_objects: senders.iter().map(|s| s.object.clone()).collect(),
-        initial_fee_balances: BTreeMap::new(),
+        initial_fee_balances: senders
+            .iter()
+            .map(|sender| (sender.address, 10_000_000))
+            .collect(),
     };
     let validated = genesis.validate().unwrap();
     let peer_ids = libp2p_identities
@@ -1036,21 +1042,13 @@ async fn a_validator_that_missed_a_payload_recovers_it_from_peers() {
     }
 }
 
-/// A validator can only execute a height it did not propose once that block's
-/// payload reaches it as shreds. When that stops happening its execution stops
-/// with it — but consensus needs only transaction IDs, so the validator kept
-/// voting and finalizing regardless, accumulating certified orders it could
-/// never execute. Observed on CI: ordering reached height 542 while execution
-/// sat at 0, the backlog growing without bound, the validator still advertising
-/// itself as healthy while its state was frozen at genesis.
-///
-/// `consensus-spec` requires the opposite: a node coordinator must stop
-/// admitting ordered payloads once execution falls behind. This drives that
-/// condition directly by silencing every shred path, and asserts the validator
-/// now reports the backlog rather than absorbing it silently.
+/// A validator cannot verify funding or execute a height without the exact
+/// payload. With every shred path silenced, fail-closed voting must prevent a
+/// certificate from forming instead of allowing ordering to race hundreds of
+/// heights ahead of frozen execution.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[allow(clippy::too_many_lines)]
-async fn execution_falling_behind_ordering_is_reported_not_absorbed_silently() {
+async fn a_missing_payload_stops_votes_before_ordering_outruns_execution() {
     let _test_guard = PIPELINE_TEST_LOCK.lock().await;
     let directory = TempDir::new().unwrap();
     let bls = Bls12381Scheme;
@@ -1111,6 +1109,7 @@ async fn execution_falling_behind_ordering_is_reported_not_absorbed_silently() {
 
     let mut tasks = Vec::new();
     let mut built = Vec::new();
+    let mut statuses = Vec::new();
     let crashes: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     for index in 0..VALIDATOR_COUNT {
@@ -1126,6 +1125,7 @@ async fn execution_falling_behind_ordering_is_reported_not_absorbed_silently() {
             finality_latency_ms: None,
             view_changes: 0,
         }));
+        statuses.push(Arc::clone(&status));
         let shared_state = Arc::new(RwLock::new(StateTree::new(StateConfig::default()).unwrap()));
         let lifecycle = BlockLifecycle::open(
             &genesis,
@@ -1217,30 +1217,30 @@ async fn execution_falling_behind_ordering_is_reported_not_absorbed_silently() {
         }));
     }
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    let reported = loop {
-        let reported = crashes.lock().map_or_else(
-            |poisoned| poisoned.into_inner().clone(),
-            |guard| guard.clone(),
-        );
-        if reported
-            .iter()
-            .any(|reason| reason.contains("execution has fallen too far behind ordering"))
-        {
-            break reported;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "a validator whose execution had stalled kept accepting certified orders instead of \
-             reporting the backlog: {reported:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let until_genesis =
+        u64::try_from(u128::from(genesis_time).saturating_sub(now)).unwrap_or_default();
+    tokio::time::sleep(Duration::from_millis(until_genesis + 3_000)).await;
+    let reported = crashes.lock().map_or_else(
+        |poisoned| poisoned.into_inner().clone(),
+        |guard| guard.clone(),
+    );
     assert!(
-        reported
+        reported.is_empty(),
+        "missing payloads must be ordinary vote refusal, not a pipeline crash: {reported:?}"
+    );
+    assert!(
+        statuses
             .iter()
-            .any(|reason| reason.contains("still waiting to execute height")),
-        "the backlog report must name the height execution is stuck on: {reported:?}"
+            .all(|status| status.read().unwrap().finalized_height == 0),
+        "validators finalized an order they could not fund or execute: {:#?}",
+        statuses
+            .iter()
+            .map(|status| status.read().unwrap().clone())
+            .collect::<Vec<_>>()
     );
 
     for task in tasks {
@@ -1314,7 +1314,7 @@ async fn malformed_gossiped_transaction_does_not_kill_the_pipeline() {
         equivocation_slash_basis_points: 5_000,
         validators: validators.clone(),
         initial_objects: vec![target.clone()],
-        initial_fee_balances: BTreeMap::new(),
+        initial_fee_balances: BTreeMap::from([(owner, 10_000_000)]),
     };
     let validated = genesis.validate().unwrap();
 
@@ -1555,7 +1555,7 @@ async fn admitted_transaction_survives_a_restart_before_finalization() {
         equivocation_slash_basis_points: 5_000,
         validators: validators.clone(),
         initial_objects: vec![target.clone()],
-        initial_fee_balances: BTreeMap::new(),
+        initial_fee_balances: BTreeMap::from([(owner, 10_000_000)]),
     };
     let validated = genesis.validate().unwrap();
 

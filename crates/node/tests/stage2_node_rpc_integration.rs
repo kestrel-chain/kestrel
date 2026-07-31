@@ -279,6 +279,12 @@ fn fixture_genesis(
     Vec<identity::Keypair>,
     Vec<TcpListener>,
 ) {
+    let initial_owner = match &initial_object.owner {
+        Owner::Single(owner) => *owner,
+        other @ Owner::Shared => {
+            panic!("RPC fixture object must have a single owner, got {other:?}")
+        }
+    };
     let scheme = Bls12381Scheme;
     let mut keys = Vec::new();
     let mut gossip_identities = Vec::new();
@@ -324,7 +330,7 @@ fn fixture_genesis(
             equivocation_slash_basis_points: 5_000,
             validators,
             initial_objects: vec![initial_object],
-            initial_fee_balances: BTreeMap::new(),
+            initial_fee_balances: BTreeMap::from([(initial_owner, 10_000_000)]),
         },
         keys,
         gossip_identities,

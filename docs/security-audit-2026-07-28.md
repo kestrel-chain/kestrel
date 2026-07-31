@@ -193,6 +193,7 @@ payload before validation.
 
 **Severity:** High
 **Class:** Economic integrity / fee bypass
+**Status:** Remediated on `main` (2026-07-30)
 **Affected:** `crates/node/src/pipeline.rs:118-133`,
 `crates/node/src/pipeline.rs:899-970`,
 `crates/node/src/lifecycle.rs:540-589`,
@@ -219,6 +220,19 @@ failures as consensus-critical before certification, never as a warning after
 state execution. Add unfunded, balance-race, overflow, restart, and multi-
 transaction conservation tests. Add global/per-peer mempool count and byte
 limits independently of fees.
+
+**Remediation:** Admission now atomically reserves the signed worst-case charge,
+and certified payload validation binds that reservation to the certified base
+fee and leader before execution. Settlement is consensus-critical: actual
+compute is charged, unused capacity is released, and fee-ledger state is only
+published with the durable block batch. Followers withhold votes for missing or
+unfunded payloads. The pipeline enforces global and per-peer count and encoded-
+byte limits, preserves peer attribution across restart replay, and retains
+accounting until canonical submission or rollback. Genesis creation now
+requires a non-empty initial fee-balance map. Regression coverage includes
+unfunded execution rejection, balance races, validator-credit overflow,
+zero-price multi-transaction settlement, refunds, restart replay, and each
+capacity boundary.
 
 ### KST-006 — Transactions are replayable across Kestrel networks
 

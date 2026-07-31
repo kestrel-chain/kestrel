@@ -512,7 +512,14 @@ historical snapshots, but they are not open debt in their original form:
   commitment doesn't match the certified one (`OrderMismatch`) or whose base
   fee would exceed a sender's signed cap (`FeeCapExceeded`). Genesis can seed
   starting balances (`initial_fee_balances`), and `FeeLedger` balances persist
-  in the same durable checkpoint as nonces/state.
+  in the same durable checkpoint as nonces/state. KST-005 then closed the
+  remaining fail-open gap: admission reserves the full signed maximum,
+  certified payload validation binds the reservation to the canonical price
+  and leader before execution, actual-compute settlement releases the unused
+  amount, and any invariant failure aborts rather than committing unpaid state.
+  Stage 2 also enforces global/per-peer transaction and encoded-byte limits
+  whose durable accounting survives restart until canonical submission or
+  rollback. The genesis CLI now requires at least one funded account.
 - TD-022 was closed by enforcing mutually exclusive order/timeout first-round
   votes. Selective-delivery production-code and multi-process equivocation tests
   cover the previously unsafe trace under the strict less-than-20% bound.
